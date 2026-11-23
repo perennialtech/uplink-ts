@@ -12,21 +12,42 @@ export const PLAYER_DEFAULTS = {
   startBandwidthGbps: 1,
 } as const;
 
-/**
- * Reference tick costs per unit of work (normalized against 60 GHz baseline CPU).
- * Mirrors Uplink's data.h tick scaling.
- */
 export const TASK_TICKS = {
   copyPerGq: 45,
   deletePerGq: 9,
   decryptPerGq: 90,
   logDelete: 60,
   logUndelete: 60,
+  logModify: 50,
   disableProxy: 150,
   disableFirewall: 120,
-  lanScan: 300,
-  dictionaryWord: 0.2,
+  lanScan: 180,
+  lanProbe: 90,
+  lanSpoof: 100,
+  lanForce: 100,
+  dictionaryBase: 80,
 } as const;
+
+export const DICTIONARY_WORDS: readonly string[] = [
+  "admin",
+  "rosebud",
+  "password",
+  "phoenix",
+  "obsidian",
+  "protocol",
+  "cipher",
+  "vector",
+  "mercury",
+  "eclipse",
+  "valkyrie",
+  "sentinel",
+  "cascade",
+  "horizon",
+  "solstice",
+  "vault",
+  "override",
+  "nexus",
+];
 
 /** Base seconds to trace a single hop by server archetype (-1 = no trace) */
 export const TRACE_SPEED_SEC: Readonly<Record<ServerKind, number>> = {
@@ -67,7 +88,6 @@ export const HACK_DIFFICULTY: Readonly<Record<ServerKind, number>> = {
   lan: 200,
 };
 
-/** Security level multiplier (level 1 admin = 2.0x harder; level 10 = 0.5x) */
 export const SECURITY_LEVEL_MODIFIER: readonly number[] = [
   1.0, 2.0, 1.5, 1.2, 1.0, 1.0, 0.9, 0.7, 0.5, 0.5, 0.5,
 ];
@@ -133,6 +153,7 @@ export const SOFTWARE_CATALOG: readonly SoftwareDefinition[] = [
   { id: "log_deleter", name: "Log Deleter", version: 2, category: "file_util", cost: 1000, sizeGq: 1, description: "Overwrites a log entry (recoverable with Log Undeleter)." },
   { id: "log_deleter", name: "Log Deleter", version: 4, category: "file_util", cost: 4000, sizeGq: 1, description: "Cleanly wipes a log entry so passive traces stop cold." },
   { id: "log_undeleter", name: "Log Undeleter", version: 1, category: "file_util", cost: 5000, sizeGq: 1, description: "Recovers logs erased by Log Deleter v1–v3." },
+  { id: "log_modifier", name: "Log Modifier", version: 1, category: "file_util", cost: 4000, sizeGq: 1, description: "Rewrites the source IP of a log entry to deflect traces or frame targets." },
   { id: "file_copier", name: "File Copier", version: 1, category: "file_util", cost: 0, sizeGq: 1, description: "Downloads files from a remote server to your gateway." },
   { id: "file_deleter", name: "File Deleter", version: 1, category: "file_util", cost: 0, sizeGq: 1, description: "Deletes files from local or remote storage." },
   { id: "decrypter", name: "Decrypter", version: 1, category: "cracker", cost: 800, sizeGq: 2, description: "Decrypts Level 1 encrypted files." },
@@ -143,7 +164,10 @@ export const SOFTWARE_CATALOG: readonly SoftwareDefinition[] = [
   { id: "firewall_disable", name: "Firewall Disable", version: 1, category: "cracker", cost: 2500, sizeGq: 2, description: "Disables a remote Firewall (triggers trace)." },
   { id: "firewall_bypass", name: "Firewall Bypass", version: 5, category: "bypasser", cost: 10000, sizeGq: 1, description: "Silently bypasses Firewall up to Level 5." },
   { id: "monitor_bypass", name: "Monitor Bypass", version: 5, category: "bypasser", cost: 10000, sizeGq: 1, description: "Delays active trace detection on Monitor up to Level 5." },
-  { id: "lan_scan", name: "LAN Scan", version: 3, category: "lan", cost: 6000, sizeGq: 2, description: "Discovers hidden routers, terminals, and locks inside corporate LANs." },
+  { id: "lan_scan", name: "LAN Scan", version: 3, category: "lan", cost: 6000, sizeGq: 2, description: "Discovers routers, hubs, locks, and terminals inside corporate LANs." },
+  { id: "lan_probe", name: "LAN Probe", version: 3, category: "lan", cost: 4000, sizeGq: 2, description: "Maps outgoing links from any visible LAN node." },
+  { id: "lan_spoof", name: "LAN Spoof", version: 3, category: "lan", cost: 5000, sizeGq: 2, description: "Spoofs an Auth Server or subnet node to unlock protected LAN locks." },
+  { id: "lan_force", name: "LAN Force", version: 1, category: "lan", cost: 6000, sizeGq: 2, description: "Forces a LAN lock open immediately (alerts the LAN sysadmin)." },
 ];
 
 export const CPU_CATALOG: readonly CpuSpec[] = [

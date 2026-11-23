@@ -5,11 +5,13 @@ import {
   PLAYER_DEFAULTS,
   TRACE_SPEED_SEC,
 } from "./catalog";
+import { generateCitizens } from "./records";
 import { SeededRng } from "./rng";
 import type {
   EmailMessage,
   LanNode,
   Mission,
+  NewsItem,
   ServerKind,
   ServerNode,
   VirtualFile,
@@ -68,7 +70,12 @@ function makeIp(rng: SeededRng, used: Set<string>): string {
   throw new Error("Failed to allocate unique IP");
 }
 
-function makeFiles(rng: SeededRng, companySlug: string, count: number, encryptedChance: number): VirtualFile[] {
+function makeFiles(
+  rng: SeededRng,
+  companySlug: string,
+  count: number,
+  encryptedChance: number
+): VirtualFile[] {
   const files: VirtualFile[] = [];
   for (let i = 0; i < count; i++) {
     const prefix = rng.pick(FILE_PREFIXES);
@@ -84,14 +91,81 @@ function makeFiles(rng: SeededRng, companySlug: string, count: number, encrypted
   return files;
 }
 
-function makeSampleLan(): LanNode[] {
+function makeCorporateLan(): LanNode[] {
   return [
-    { id: "router", kind: "router", x: 90, y: 150, visible: true, unlocked: true, connectedTo: ["hub_1"] },
-    { id: "hub_1", kind: "hub", x: 230, y: 150, visible: false, unlocked: true, connectedTo: ["router", "term_1", "lock_1"] },
-    { id: "term_1", kind: "terminal", x: 230, y: 60, visible: false, unlocked: true, connectedTo: ["hub_1"] },
-    { id: "lock_1", kind: "lock", x: 380, y: 150, visible: false, unlocked: false, connectedTo: ["hub_1", "auth_1", "main"] },
-    { id: "auth_1", kind: "auth_server", x: 380, y: 245, visible: false, unlocked: true, connectedTo: ["lock_1"] },
-    { id: "main", kind: "main_server", x: 540, y: 150, visible: false, unlocked: false, connectedTo: ["lock_1"] },
+    {
+      id: "router",
+      label: "Edge Router",
+      kind: "router",
+      x: 70,
+      y: 130,
+      visible: true,
+      probed: true,
+      unlocked: true,
+      spoofed: false,
+      connectedTo: ["hub_1"],
+    },
+    {
+      id: "hub_1",
+      label: "Core Hub",
+      kind: "hub",
+      x: 190,
+      y: 130,
+      visible: false,
+      probed: false,
+      unlocked: true,
+      spoofed: false,
+      connectedTo: ["router", "auth_1", "lock_1"],
+    },
+    {
+      id: "auth_1",
+      label: "Auth Server",
+      kind: "auth_server",
+      x: 190,
+      y: 230,
+      visible: false,
+      probed: false,
+      unlocked: true,
+      spoofed: false,
+      connectedTo: ["hub_1"],
+    },
+    {
+      id: "lock_1",
+      label: "Security Lock",
+      kind: "lock",
+      x: 330,
+      y: 130,
+      visible: false,
+      probed: false,
+      unlocked: false,
+      spoofed: false,
+      requiresNodeId: "auth_1",
+      connectedTo: ["hub_1", "term_1", "main"],
+    },
+    {
+      id: "term_1",
+      label: "Ops Terminal",
+      kind: "terminal",
+      x: 330,
+      y: 45,
+      visible: false,
+      probed: false,
+      unlocked: true,
+      spoofed: false,
+      connectedTo: ["lock_1"],
+    },
+    {
+      id: "main",
+      label: "Main Server",
+      kind: "main_server",
+      x: 490,
+      y: 130,
+      visible: false,
+      probed: false,
+      unlocked: true,
+      spoofed: false,
+      connectedTo: ["lock_1"],
+    },
   ];
 }
 
@@ -99,6 +173,8 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
   const rng = new SeededRng(seed);
   const usedIps = new Set<string>(["127.0.0.1"]);
   const servers: Record<string, ServerNode> = {};
+  const citizens = generateCitizens(rng, 12);
+  const citizenList = Object.values(citizens);
 
   const homeLoc = GATEWAY_LOCATIONS[0]!; // London
   const playerIp = "127.0.0.1";
@@ -182,32 +258,46 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
     discovered: true,
     adminPassword: "rosebud",
     security: [{ kind: "monitor", level: 1, enabled: true, bypassed: false }],
-    files: [
-      { id: "file_test_1", name: "Uplink_Test_Data.dat", sizeGq: 3, encryptedLevel: 0 },
-    ],
+    files: [{ id: "file_test_1", name: "Uplink_Test_Data.dat", sizeGq: 3, encryptedLevel: 0 }],
   });
 
-  addServer({
+  const gcd = addServer({
     name: "Global Criminal Database",
     companyName: "Interpol",
     kind: "database_criminal",
     x: 505,
     y: 150,
-    discovered: false,
+    discovered: true,
+    adminPassword: "sentinel",
     security: [
-      { kind: "monitor", level: 3, enabled: true, bypassed: false },
+      { kind: "monitor", level: 2, enabled: true, bypassed: false },
       { kind: "proxy", level: 2, enabled: true, bypassed: false },
     ],
   });
 
-  addServer({
+  const iad = addServer({
     name: "International Academic Database",
     companyName: "World Education Council",
     kind: "database_academic",
     x: 245,
     y: 195,
-    discovered: false,
+    discovered: true,
+    adminPassword: "horizon",
     security: [{ kind: "monitor", level: 1, enabled: true, bypassed: false }],
+  });
+
+  const ssd = addServer({
+    name: "Social Security Database",
+    companyName: "Global Civil Registry",
+    kind: "database_social",
+    x: 215,
+    y: 230,
+    discovered: true,
+    adminPassword: "cascade",
+    security: [
+      { kind: "monitor", level: 2, enabled: true, bypassed: false },
+      { kind: "proxy", level: 1, enabled: true, bypassed: false },
+    ],
   });
 
   const bank = addServer({
@@ -217,18 +307,83 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
     x: 515,
     y: 135,
     discovered: true,
+    adminPassword: "vault",
+    security: [
+      { kind: "monitor", level: 3, enabled: true, bypassed: false },
+      { kind: "proxy", level: 3, enabled: true, bypassed: false },
+    ],
+  });
+
+  const playerAccountNum = "1004921";
+  bank.bankAccounts.push({
+    accountNumber: playerAccountNum,
+    ownerName: handle,
+    password: "vault",
+    balance: PLAYER_DEFAULTS.credits,
+    loan: 0,
+    statements: [],
+  });
+
+  // Add rich NPC bank accounts for heist missions
+  for (let i = 0; i < 4; i++) {
+    const cit = citizenList[i]!;
+    bank.bankAccounts.push({
+      accountNumber: String(2005100 + i * 137),
+      ownerName: cit.fullName,
+      password: rng.pick(PASSWORDS),
+      balance: rng.int(12000, 85000),
+      loan: rng.int(0, 5000),
+      statements: [],
+    });
+  }
+
+  // Storyline faction mainframes
+  const arcMainframe = addServer({
+    name: "ARC Central Mainframe",
+    companyName: "Andromeda Research Corp",
+    kind: "central_mainframe",
+    x: 155,
+    y: 215,
+    discovered: false,
+    adminPassword: "eclipse",
     security: [
       { kind: "monitor", level: 4, enabled: true, bypassed: false },
       { kind: "proxy", level: 4, enabled: true, bypassed: false },
       { kind: "firewall", level: 4, enabled: true, bypassed: false },
     ],
+    files: [
+      {
+        id: "file_revelation_core",
+        name: "Revelation_v1.0.dat",
+        sizeGq: 4,
+        encryptedLevel: 1,
+        dataTag: "revelation",
+      },
+    ],
   });
-  bank.bankAccounts.push({
-    accountNumber: "1004921",
-    ownerName: handle,
-    password: "vault",
-    balance: PLAYER_DEFAULTS.credits,
-    loan: 0,
+
+  const arunmorMainframe = addServer({
+    name: "Arunmor Central Mainframe",
+    companyName: "Arunmor Corporation",
+    kind: "central_mainframe",
+    x: 860,
+    y: 190,
+    discovered: false,
+    adminPassword: "valkyrie",
+    security: [
+      { kind: "monitor", level: 4, enabled: true, bypassed: false },
+      { kind: "proxy", level: 4, enabled: true, bypassed: false },
+      { kind: "firewall", level: 4, enabled: true, bypassed: false },
+    ],
+    files: [
+      {
+        id: "file_faith_core",
+        name: "Faith_v1.0.dat",
+        sizeGq: 4,
+        encryptedLevel: 1,
+        dataTag: "faith",
+      },
+    ],
   });
 
   // Procedural corporate servers across the globe
@@ -247,7 +402,12 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
     const y = rng.int(95, 420);
     const security: ServerNode["security"] = [];
     if (kind !== "public_access") {
-      security.push({ kind: "monitor", level: kind === "central_mainframe" ? 3 : 1, enabled: true, bypassed: false });
+      security.push({
+        kind: "monitor",
+        level: kind === "central_mainframe" ? 3 : 1,
+        enabled: true,
+        bypassed: false,
+      });
     }
     if (kind === "central_mainframe") {
       security.push({ kind: "proxy", level: 2, enabled: true, bypassed: false });
@@ -272,30 +432,40 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
     corpNodes.push(node);
   }
 
-  // One corporate LAN target
-  addServer({
+  // Corporate LAN target
+  const arcturusLan = addServer({
     name: "Arcturus Local Area Network",
     companyName: "Arcturus Defense",
     kind: "lan",
     x: 845,
-    y: 210,
+    y: 255,
     discovered: true,
+    adminPassword: "override",
     security: [
       { kind: "monitor", level: 3, enabled: true, bypassed: false },
-      { kind: "proxy", level: 3, enabled: true, bypassed: false },
+      { kind: "proxy", level: 2, enabled: true, bypassed: false },
     ],
-    files: [{ id: "file_lan_secret", name: "arcturus_prototype.dat", sizeGq: 5, encryptedLevel: 2 }],
-    lanNodes: makeSampleLan(),
+    files: [
+      { id: "file_lan_secret", name: "arcturus_prototype.dat", sizeGq: 4, encryptedLevel: 1 },
+    ],
+    lanNodes: makeCorporateLan(),
   });
 
-  // Initial Missions
+  // Rich variety of initial contracts covering every mechanic
+  const academicTarget = citizenList[4]!;
+  const criminalTarget = citizenList.find((c) => c.criminalHistory.length > 0) ?? citizenList[5]!;
+  const socialTarget = citizenList[6]!;
+  const heistAccount = bank.bankAccounts[1]!;
+  const internalTarget = corpNodes.find((n) => n.kind === "internal_services" && n.files.length > 0)!;
+  const destroyTarget = corpNodes.filter((n) => n.kind === "internal_services" && n.files.length > 0)[1]!;
+
   const missions: Mission[] = [
     {
       id: "mission_tutorial",
       kind: "steal_file",
       title: "Uplink Test Contract",
       employer: "Uplink Corporation",
-      description: `Connect to ${testMachine.name} (${testMachine.ip}), crack the admin login, copy Uplink_Test_Data.dat to your gateway, and scrub your logs at InterNIC.`,
+      description: `Connect to ${testMachine.name} (${testMachine.ip}), crack admin, copy Uplink_Test_Data.dat to your gateway, and wipe your bounce log at InterNIC.`,
       difficulty: 1,
       payment: 1500,
       minUplinkRating: 0,
@@ -304,31 +474,109 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
       accepted: false,
       completed: false,
     },
-  ];
-
-  const internalTargets = corpNodes.filter((n) => n.kind === "internal_services" && n.files.length > 0);
-  internalTargets.slice(0, 4).forEach((target, idx) => {
-    const file = target.files[0]!;
-    const isDestroy = idx % 2 === 1;
-    missions.push({
-      id: `mission_corp_${idx + 1}`,
-      kind: isDestroy ? "destroy_file" : "steal_file",
-      title: isDestroy
-        ? `Destroy corporate data at ${target.companyName}`
-        : `Acquire confidential file from ${target.companyName}`,
-      employer: COMPANIES[(idx + 5) % COMPANIES.length]!,
-      description: isDestroy
-        ? `Break into ${target.name} (${target.ip}) and delete ${file.name}. Cover your tracks afterward.`
-        : `Break into ${target.name} (${target.ip}) and copy ${file.name} to your gateway memory.`,
-      difficulty: 2 + idx,
-      payment: (isDestroy ? 1400 : 1800) + idx * 600,
-      minUplinkRating: idx < 2 ? 0 : 2,
-      targetIp: target.ip,
-      targetFileName: file.name,
+    {
+      id: "mission_academic_1",
+      kind: "change_academic",
+      title: `Boost Academic Record for ${academicTarget.fullName}`,
+      employer: "Private Client",
+      description: `Break into ${iad.name} (${iad.ip}) and raise ${academicTarget.fullName}'s GPA to 4.0.`,
+      difficulty: 2,
+      payment: 2200,
+      minUplinkRating: 0,
+      targetIp: iad.ip,
+      targetCitizenId: academicTarget.id,
+      targetValue: "4.0",
       accepted: false,
       completed: false,
-    });
-  });
+    },
+    {
+      id: "mission_steal_1",
+      kind: "steal_file",
+      title: `Acquire Confidential Data from ${internalTarget.companyName}`,
+      employer: "Vanguard Micro",
+      description: `Infiltrate ${internalTarget.name} (${internalTarget.ip}) and copy ${internalTarget.files[0]!.name} (decrypt if encrypted) to your gateway.`,
+      difficulty: 2,
+      payment: 2400,
+      minUplinkRating: 0,
+      targetIp: internalTarget.ip,
+      targetFileName: internalTarget.files[0]!.name,
+      accepted: false,
+      completed: false,
+    },
+    {
+      id: "mission_destroy_1",
+      kind: "destroy_file",
+      title: `Sabotage Research at ${destroyTarget.companyName}`,
+      employer: "Obsidian Systems",
+      description: `Break into ${destroyTarget.name} (${destroyTarget.ip}) and delete ${destroyTarget.files[0]!.name}.`,
+      difficulty: 3,
+      payment: 2800,
+      minUplinkRating: 0,
+      targetIp: destroyTarget.ip,
+      targetFileName: destroyTarget.files[0]!.name,
+      accepted: false,
+      completed: false,
+    },
+    {
+      id: "mission_criminal_1",
+      kind: "change_criminal",
+      title: `Clear Criminal History for ${criminalTarget.fullName}`,
+      employer: "Anonymous Syndicate",
+      description: `Access ${gcd.name} (${gcd.ip}), bypass/disable Proxy, and clear ${criminalTarget.fullName}'s criminal record.`,
+      difficulty: 4,
+      payment: 4200,
+      minUplinkRating: 2,
+      targetIp: gcd.ip,
+      targetCitizenId: criminalTarget.id,
+      targetValue: "clear",
+      accepted: false,
+      completed: false,
+    },
+    {
+      id: "mission_social_1",
+      kind: "change_social",
+      title: `Update Social Registry for ${socialTarget.fullName}`,
+      employer: "Meridian Logistics",
+      description: `Access ${ssd.name} (${ssd.ip}) and change ${socialTarget.fullName}'s employer to "Meridian Logistics".`,
+      difficulty: 3,
+      payment: 3200,
+      minUplinkRating: 1,
+      targetIp: ssd.ip,
+      targetCitizenId: socialTarget.id,
+      targetValue: "Meridian Logistics",
+      accepted: false,
+      completed: false,
+    },
+    {
+      id: "mission_bank_1",
+      kind: "bank_heist",
+      title: `Siphon 5,000c from ${heistAccount.ownerName}`,
+      employer: "Black Market Broker",
+      description: `Crack account #${heistAccount.accountNumber} on ${bank.name} (${bank.ip}), wire at least 5,000c to your account (#${playerAccountNum}), and delete BOTH bank statements before the audit!`,
+      difficulty: 5,
+      payment: 5000,
+      minUplinkRating: 2,
+      targetIp: bank.ip,
+      targetValue: heistAccount.accountNumber,
+      targetAmount: 5000,
+      accepted: false,
+      completed: false,
+    },
+    {
+      id: "mission_lan_1",
+      kind: "lan_infiltration",
+      title: `Infiltrate ${arcturusLan.name}`,
+      employer: "Stratos Aerospace",
+      description: `Scan and traverse ${arcturusLan.name} (${arcturusLan.ip}), spoof Auth Server or force the Security Lock, reach Main Server, and steal arcturus_prototype.dat (decrypt Level 1).`,
+      difficulty: 6,
+      payment: 8500,
+      minUplinkRating: 4,
+      targetIp: arcturusLan.ip,
+      targetFileName: "arcturus_prototype.dat",
+      accepted: false,
+      completed: false,
+    },
+  ];
 
   const emails: EmailMessage[] = [
     {
@@ -337,17 +585,34 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
       subject: "Welcome to Uplink",
       body:
         `Agent ${handle},\n\n` +
-        `Your Alpha Gateway in ${homeLoc.city} is online with 60 GHz CPU, 24 Gq memory, and 3,000 credits.\n\n` +
-        `Tip: Always bounce your connection through InterNIC (${internic.ip}) first, then through several other nodes before hitting your target. ` +
-        `After disconnecting, reconnect to InterNIC and erase your bounce log with Log Deleter v4 to defeat passive traces.\n\n` +
-        `Check the Mission Board on ${uplinkInternal.name} to accept your first contract.`,
+        `Your Alpha Gateway in ${homeLoc.city} is online with 60 GHz CPU, 24 Gq memory, and 3,000 credits at ${bank.name} (Acct #${playerAccountNum}, pw: vault).\n\n` +
+        `Field manual:\n` +
+        `1. Always bounce through InterNIC (${internic.ip}) first, then several other nodes.\n` +
+        `2. After any traced hack, reconnect to InterNIC (admin/admin) and erase your bounce log with Log Deleter v4.\n` +
+        `3. Reach Novice rating (6+ score) to unlock the ARC vs. Arunmor storyline.\n\n` +
+        `Check the Missions tab to accept your first contract.`,
       timestampMs: GAME_START_TIME_MS,
       read: false,
     },
   ];
 
+  const news: NewsItem[] = [
+    {
+      id: "news_init_1",
+      timestampMs: GAME_START_TIME_MS,
+      headline: "Uplink Corporation Opens Q2 Freelance Agent Registry",
+      body: `New remote gateways provisioned across 8 global hubs. Corporate security spending rises 18% amid growing cyber-espionage.`,
+    },
+    {
+      id: "news_init_2",
+      timestampMs: GAME_START_TIME_MS,
+      headline: "Andromeda Research Corp Announces Secret Next-Gen AI Initiative",
+      body: `ARC declined to comment on rumors surrounding internal project codenamed 'Revelation'.`,
+    },
+  ];
+
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     seed,
     rngState: rng.getState(),
     timeMs: GAME_START_TIME_MS,
@@ -355,6 +620,8 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
     player: {
       handle,
       credits: PLAYER_DEFAULTS.credits,
+      bankIp: bank.ip,
+      bankAccountNumber: playerAccountNum,
       uplinkScore: PLAYER_DEFAULTS.uplinkScore,
       neuromancerScore: PLAYER_DEFAULTS.neuromancerScore,
       disavowed: false,
@@ -376,9 +643,10 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
           { id: "log_deleter", version: 1, sizeGq: 1 },
         ],
       },
-      savedBounceRoute: [internic.ip],
+      savedBounceRoute: [internic.ip, uplinkInternal.ip],
     },
     servers,
+    citizens,
     connection: {
       route: [playerIp],
       connected: false,
@@ -388,11 +656,21 @@ export function createInitialWorld(handle: string, seed = 20100324): WorldState 
       secondsUntilNextHop: 0,
       totalTraceSecondsRemaining: 0,
       totalTraceSecondsInitial: 0,
+      lanSession: null,
     },
     tasks: [],
     missions,
     emails,
+    news,
+    story: {
+      stage: "dormant",
+      faction: "none",
+      revelationCount: 0,
+      faithCount: 0,
+      arcServerIp: arcMainframe.ip,
+      arunmorServerIp: arunmorMainframe.ip,
+    },
     scheduledEvents: [],
-    idCounter: 100,
+    idCounter: 200,
   };
 }
