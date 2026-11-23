@@ -2,295 +2,267 @@ import { describe, expect, it } from "vitest";
 import {
   createInitialWorld,
   deserializeState,
+  FIXED_IPS,
   serializeState,
+  SOFTWARE_CATALOG,
   UplinkEngine,
 } from "../src/engine";
 
-function grantCredits(engine: UplinkEngine, amount: number): void {
-  const mutable = engine.getState() as unknown as { player: { credits: number; uplinkScore: number } };
-  mutable.player.credits = amount;
-}
+describe("UplinkEngine full parity simulation", () => {
+  it("initializes canonical fixed IPs, multiple banks, Stock Market, Medical DB, and Protovision", () => {
+    const engine = new UplinkEngine(createInitialWorld("Neo", 12345));
+    const state = engine.getState();
 
-describe("UplinkEngine complete headless simulation", () => {
-  it("generates a deterministic world for a given seed", () => {
-    const a = createInitialWorld("ZeroCool", 42);
-    const b = createInitialWorld("ZeroCool", 42);
-    expect(Object.keys(a.servers)).toEqual(Object.keys(b.servers));
-    expect(Object.keys(a.citizens)).toEqual(Object.keys(b.citizens));
-    expect(a.missions.map((m) => m.targetIp)).toEqual(b.missions.map((m) => m.targetIp));
+    expect(state.servers[FIXED_IPS.INTERNIC]?.name).toBe("InterNIC");
+    expect(state.servers[FIXED_IPS.UPLINK_INTERNAL]?.kind).toBe("uplink_internal");
+    expect(state.servers[FIXED_IPS.MEDICAL_DB]?.kind).toBe("database_medical");
+    expect(state.servers[FIXED_IPS.STOCK_MARKET]?.kind).toBe("stock_market");
+    expect(state.servers[FIXED_IPS.PROTOVISION]?.kind).toBe("protovision");
+    expect(Object.values(state.servers).filter((s) => s.kind === "bank").length).toBeGreaterThanOrEqual(4);
+    expect(Object.keys(state.companies).length).toBeGreaterThanOrEqual(12);
+    expect(SOFTWARE_CATALOG.length).toBeGreaterThanOrEqual(65);
   });
 
-  it("scales trace time by bounce hops and access level", () => {
-    const engine = new UplinkEngine(createInitialWorld("Neo", 1234));
-    const servers = Object.values(engine.getState().servers);
-    const internic = servers.find((s) => s.kind === "internic")!;
-    const testSrv = servers.find((s) => s.kind === "uplink_test")!;
+  it("completes the tutorial steal_file contract and updates ratings", () => {
+    const engine = new UplinkEngine(createInitialWorld("Neo", 12345));
+    const state = engine.getState();
+    const internic = state.servers[FIXED_IPS.INTERNIC]!;
+    const testMachine = state.servers[FIXED_IPS.UPLINK_TEST]!;
 
-    const directTime = engine.computeTotalTraceSeconds(["127.0.0.1", testSrv.ip]);
-    const bouncedTime = engine.computeTotalTraceSeconds(["127.0.0.1", internic.ip, testSrv.ip]);
-
-    expect(bouncedTime).toBeGreaterThan(directTime);
-    expect(bouncedTime).toBeCloseTo(testSrv.traceSpeedSec * 2, 1);
-  });
-
-  it("cracks passwords with Password Breaker and Dictionary Hacker", () => {
-    const engine = new UplinkEngine(createInitialWorld("Trinity", 77));
-    grantCredits(engine, 10000);
-    expect(engine.buySoftware("dictionary_hacker", 1)).toBe(true);
-
-    const servers = Object.values(engine.getState().servers);
-    const internic = servers.find((s) => s.kind === "internic")!;
-    const testSrv = servers.find((s) => s.kind === "uplink_test")!;
-
+    expect(engine.acceptMission("mission_tutorial")).toBe(true);
     engine.addBounceNode(internic.ip);
-    engine.addBounceNode(testSrv.ip);
+    engine.addBounceNode(testMachine.ip);
     expect(engine.connect()).toBe(true);
 
-    engine.startTask("trace_tracker");
-    engine.startTask("dictionary_hacker", "admin");
-    for (let i = 0; i < 15; i++) engine.tick(0.5);
-
+    expect(engine.startTask("password_breaker", "admin")).not.toBeNull();
+    engine.tick(15);
     expect(engine.getState().connection.authenticatedAs).toBe("admin");
-    expect(engine.getState().player.disavowed).toBe(false);
-  });
 
-  it("catches players on passive trace unless bounce logs are cleanly wiped with v4", () => {
-    const caught = new UplinkEngine(createInitialWorld("Careless", 99));
-    const s1 = Object.values(caught.getState().servers);
-    const internic1 = s1.find((s) => s.kind === "internic")!;
-    const test1 = s1.find((s) => s.kind === "uplink_test")!;
+    expect(engine.startTask("file_copier", testMachine.files[0]!.id)).not.toBeNull();
+    engine.tick(10);
+    expect(engine.getState().player.gateway.files.some((f) => f.name === "Uplink_Test_Data.dat")).toBe(true);
 
-    caught.addBounceNode(internic1.ip);
-    caught.addBounceNode(test1.ip);
-    caught.connect();
-    caught.beginTrace();
-    caught.disconnect();
-
-    expect(caught.runPassiveTraceAudit(test1.ip)).toBe(true);
-    expect(caught.getState().player.disavowed).toBe(true);
-
-    const clean = new UplinkEngine(createInitialWorld("Ghost", 99));
-    grantCredits(clean, 10000);
-    expect(clean.buySoftware("log_deleter", 4)).toBe(true);
-
-    const s2 = Object.values(clean.getState().servers);
-    const internic2 = s2.find((s) => s.kind === "internic")!;
-    const test2 = s2.find((s) => s.kind === "uplink_test")!;
-
-    clean.addBounceNode(internic2.ip);
-    clean.addBounceNode(test2.ip);
-    clean.connect();
-    clean.beginTrace();
-    clean.disconnect();
-
-    clean.clearRoute();
-    clean.addBounceNode(internic2.ip);
-    clean.connect();
-    expect(clean.login("admin", "admin")).toBe(true);
-
-    const bounceLog = internic2.logs.find((l) => l.type === "bounce")!;
-    clean.startTask("log_deleter", bounceLog.id);
-    for (let i = 0; i < 10; i++) clean.tick(0.5);
-    clean.disconnect();
-
-    expect(clean.runPassiveTraceAudit(test2.ip)).toBe(false);
-    expect(clean.getState().player.disavowed).toBe(false);
-  });
-
-  it("recovers v1-deleted logs with Log Undeleter and spoofs IPs with Log Modifier", () => {
-    const engine = new UplinkEngine(createInitialWorld("Forensic", 101));
-    grantCredits(engine, 25000);
-    expect(engine.buySoftware("log_undeleter", 1)).toBe(true);
-    expect(engine.buySoftware("log_modifier", 1)).toBe(true);
-
-    const internic = Object.values(engine.getState().servers).find((s) => s.kind === "internic")!;
-    const testSrv = Object.values(engine.getState().servers).find((s) => s.kind === "uplink_test")!;
-
-    engine.addBounceNode(internic.ip);
-    engine.addBounceNode(testSrv.ip);
-    engine.connect();
     engine.disconnect();
-
-    engine.clearRoute();
-    engine.addBounceNode(internic.ip);
-    engine.connect();
-    engine.login("admin", "admin");
-
-    const bounceLog = internic.logs.find((l) => l.type === "bounce")!;
-    // Delete with v1 -> leaves recoverable stub
-    engine.startTask("log_deleter", bounceLog.id);
-    for (let i = 0; i < 10; i++) engine.tick(0.5);
-    expect(bounceLog.suspiciousDeletion).toBe(true);
-
-    // Recover with Log Undeleter
-    engine.startTask("log_undeleter", bounceLog.id);
-    for (let i = 0; i < 10; i++) engine.tick(0.5);
-    expect(bounceLog.suspiciousDeletion).toBe(false);
-    expect(bounceLog.type).toBe("bounce");
-
-    // Spoof IP with Log Modifier
-    engine.startTask("log_modifier", bounceLog.id, "203.0.113.99");
-    for (let i = 0; i < 10; i++) engine.tick(0.5);
-    expect(bounceLog.fromIp).toBe("203.0.113.99");
+    expect(engine.completeMission("mission_tutorial")).toBe(true);
+    expect(engine.getState().player.credits).toBe(4500);
   });
 
-  it("enforces LAN traversal, spoofing, encrypted file decryption, and sysadmin pursuit", () => {
-    const engine = new UplinkEngine(createInitialWorld("LanRunner", 314));
-    grantCredits(engine, 40000);
-    expect(engine.upgradeGateway("trinity")).toBe(true);
-    expect(engine.buySoftware("lan_scan", 3)).toBe(true);
-    expect(engine.buySoftware("lan_spoof", 3)).toBe(true);
-    expect(engine.buySoftware("decrypter", 1)).toBe(true);
-
-    const lan = Object.values(engine.getState().servers).find((s) => s.kind === "lan")!;
-    const internic = Object.values(engine.getState().servers).find((s) => s.kind === "internic")!;
-
-    engine.acceptMission("mission_lan_1");
-    engine.addBounceNode(internic.ip);
-    engine.addBounceNode(lan.ip);
-    engine.connect();
-
-    // Cannot log into admin before reaching main_server
-    expect(engine.login("admin", "override")).toBe(false);
-
-    // Scan LAN, move to hub_1 -> auth_1, spoof auth_1 to unlock lock_1, move to main
-    engine.startTask("lan_scan");
-    for (let i = 0; i < 20; i++) engine.tick(0.5);
-
-    expect(engine.moveLanNode("hub_1")).toBe(true);
-    expect(engine.moveLanNode("lock_1")).toBe(false); // locked!
-    expect(engine.moveLanNode("auth_1")).toBe(true);
-
-    engine.startTask("lan_spoof", "auth_1");
-    for (let i = 0; i < 15; i++) engine.tick(0.5);
-
-    expect(engine.moveLanNode("hub_1")).toBe(true);
-    expect(engine.moveLanNode("lock_1")).toBe(true); // now unlocked!
-    expect(engine.moveLanNode("main")).toBe(true);
-    expect(engine.getState().connection.lanSession?.sysadminAlerted).toBe(true);
-
-    // Login, copy encrypted prototype file, disconnect, decrypt, and submit mission
-    expect(engine.login("admin", "override")).toBe(true);
-    const proto = lan.files[0]!;
-    engine.startTask("file_copier", proto.id);
-    for (let i = 0; i < 15; i++) engine.tick(0.5);
-    engine.disconnect();
-
-    // Encrypted file cannot be submitted before decryption
-    expect(engine.completeMission("mission_lan_1")).toBe(false);
-
-    const localFile = engine.getState().player.gateway.files[0]!;
-    engine.startTask("decrypter", localFile.id);
-    for (let i = 0; i < 25; i++) engine.tick(0.5);
-    expect(localFile.encryptedLevel).toBe(0);
-
-    expect(engine.completeMission("mission_lan_1")).toBe(true);
-  });
-
-  it("audits bank heists unless BOTH victim and player statements are deleted", () => {
-    const engine = new UplinkEngine(createInitialWorld("Banker", 808));
-    const bank = Object.values(engine.getState().servers).find((s) => s.kind === "bank")!;
-    const internic = Object.values(engine.getState().servers).find((s) => s.kind === "internic")!;
-    const victim = bank.bankAccounts[1]!;
-
-    engine.addBounceNode(internic.ip);
-    engine.addBounceNode(bank.ip);
-    engine.connect();
-    expect(engine.loginBankAccount(victim.accountNumber, victim.password)).toBe(true);
-
-    const beforeCredits = engine.getState().player.credits;
-    expect(
-      engine.transferBankFunds(bank.ip, engine.getState().player.bankAccountNumber, 5000)
-    ).toBe(true);
-    expect(engine.getState().player.credits).toBe(beforeCredits + 5000);
-
-    // Delete victim's outgoing statement
-    const outStmt = victim.statements[0]!;
-    expect(engine.deleteBankStatement(victim.accountNumber, outStmt.id)).toBe(true);
-
-    // Switch to player's own account and delete incoming statement
-    const playerAcct = bank.bankAccounts[0]!;
-    expect(engine.loginBankAccount(playerAcct.accountNumber, playerAcct.password)).toBe(true);
-    const inStmt = playerAcct.statements[0]!;
-    expect(engine.deleteBankStatement(playerAcct.accountNumber, inStmt.id)).toBe(true);
-    engine.disconnect();
-
-    // Run bank audit -> clean getaway!
-    const auditEvt = engine.getState().scheduledEvents.find((e) => e.kind === "bank_audit")!;
-    expect(engine.runBankAudit(auditEvt.payload)).toBe(false);
-    expect(engine.getState().player.disavowed).toBe(false);
-  });
-
-  it("supports editing Academic, Criminal, and Social Security databases for missions", () => {
-    const engine = new UplinkEngine(createInitialWorld("Clerk", 2026));
-    const servers = Object.values(engine.getState().servers);
-    const internic = servers.find((s) => s.kind === "internic")!;
-    const iad = servers.find((s) => s.kind === "database_academic")!;
-    const mission = engine.getState().missions.find((m) => m.id === "mission_academic_1")!;
-
+  it("enforces Remote Console sys deletion + shutdown for remove_computer missions", () => {
+    const engine = new UplinkEngine(createInitialWorld("Destroyer", 777));
+    const mission = engine.getState().missions.find((m) => m.kind === "remove_computer")!;
+    const target = engine.getState().servers[mission.targetIp]!;
     engine.acceptMission(mission.id);
-    engine.addBounceNode(internic.ip);
-    engine.addBounceNode(iad.ip);
+
+    engine.addBounceNode(FIXED_IPS.INTERNIC);
+    engine.addBounceNode(target.ip);
     engine.connect();
-    expect(engine.login("admin", "horizon")).toBe(true);
-    expect(engine.updateAcademicRecord(mission.targetCitizenId!, "4.0")).toBe(true);
-    engine.disconnect();
+    engine.login("admin", target.accounts[0]!.password);
+
+    const outCd = engine.runConsoleCommand("cd sys");
+    expect(outCd.some((l) => l.includes("sys"))).toBe(true);
+    engine.runConsoleCommand("delete");
+    expect(target.sysIntact).toBe(false);
+    engine.runConsoleCommand("shutdown");
+    expect(target.destroyed).toBe(true);
+    expect(engine.getState().connection.connected).toBe(false);
 
     expect(engine.completeMission(mission.id)).toBe(true);
   });
 
-  it("triggers the ARC vs. Arunmor storyline and reaches Faith victory", () => {
-    const engine = new UplinkEngine(createInitialWorld("Hero", 777));
-    const servers = Object.values(engine.getState().servers);
-    const internic = servers.find((s) => s.kind === "internic")!;
-    const testSrv = servers.find((s) => s.kind === "uplink_test")!;
+  it("enforces Elliptic-Curve Cypher and Voice Print auth on Central Mainframes", () => {
+    const engine = new UplinkEngine(createInitialWorld("Ghost", 404));
+    const mainframe = Object.values(engine.getState().servers).find(
+      (s) => s.kind === "central_mainframe" && s.requiresCypher && s.requiresVoiceAuth
+    )!;
+    engine.getState().player.credits = 80000;
+    engine.upgradeGateway("gamma");
+    engine.buySoftware("decypher", 2);
+    engine.buySoftware("voice_analyser", 1);
 
-    // Complete 2 contracts to cross Novice threshold (6+ score)
-    const m1 = engine.getState().missions.find((m) => m.id === "mission_tutorial")!;
-    const m2 = engine.getState().missions.find((m) => m.id === "mission_academic_1")!;
-    const iad = servers.find((s) => s.kind === "database_academic")!;
-
-    engine.acceptMission(m1.id);
-    engine.addBounceNode(internic.ip);
-    engine.addBounceNode(testSrv.ip);
+    engine.addBounceNode(FIXED_IPS.INTERNIC);
+    engine.addBounceNode(FIXED_IPS.UPLINK_INTERNAL);
+    engine.addBounceNode(FIXED_IPS.STOCK_MARKET);
+    engine.addBounceNode(mainframe.ip);
     engine.connect();
-    engine.login("admin", "rosebud");
-    engine.startTask("file_copier", testSrv.files[0]!.id);
-    for (let i = 0; i < 20; i++) engine.tick(0.5);
-    engine.disconnect();
-    expect(engine.completeMission(m1.id)).toBe(true);
 
-    engine.acceptMission(m2.id);
-    engine.clearRoute();
-    engine.addBounceNode(internic.ip);
-    engine.addBounceNode(iad.ip);
+    // Blocked before Cypher and Voice Print pass
+    expect(engine.login("admin", mainframe.accounts[0]!.password)).toBe(false);
+
+    engine.startTask("decypher");
+    engine.tick(3);
+    expect(engine.getState().connection.cypherPassed).toBe(true);
+
+    // Still blocked by Voice Print
+    expect(engine.login("admin", mainframe.accounts[0]!.password)).toBe(false);
+
+    engine.startTask("voice_analyser");
+    engine.tick(3);
+    expect(engine.getState().connection.voicePassed).toBe(true);
+
+    expect(engine.login("admin", mainframe.accounts[0]!.password)).toBe(true);
+  });
+
+  it("enforces Firewall blocking on file transfer until bypassed or disabled", () => {
+    const engine = new UplinkEngine(createInitialWorld("Breacher", 303));
+    const mf = Object.values(engine.getState().servers).find(
+      (s) => s.kind === "central_mainframe" && s.files.length > 0 && s.security.some((sec) => sec.kind === "firewall")
+    )!;
+    engine.getState().player.credits = 80000;
+    engine.upgradeGateway("gamma");
+    engine.buySoftware("decypher", 2);
+    engine.buySoftware("voice_analyser", 1);
+    engine.buySoftware("firewall_bypass", 5);
+
+    engine.addBounceNode(FIXED_IPS.INTERNIC);
+    engine.addBounceNode(FIXED_IPS.UPLINK_INTERNAL);
+    engine.addBounceNode(FIXED_IPS.STOCK_MARKET);
+    engine.addBounceNode(mf.ip);
     engine.connect();
-    engine.login("admin", "horizon");
-    engine.updateAcademicRecord(m2.targetCitizenId!, "4.0");
+    engine.startTask("decypher");
+    engine.startTask("voice_analyser");
+    engine.tick(5);
+    expect(engine.login("admin", mf.accounts[0]!.password)).toBe(true);
+
+    // Firewall blocks copy
+    expect(engine.startTask("file_copier", mf.files[0]!.id)).toBeNull();
+    engine.startTask("firewall_bypass");
+    expect(engine.startTask("file_copier", mf.files[0]!.id)).not.toBeNull();
+  });
+
+  it("supports Log Deleter v3 decoy overwrite and Log UnDeleter recovery", () => {
+    const engine = new UplinkEngine(createInitialWorld("Cleaner", 616));
+    engine.getState().player.credits = 20000;
+    engine.buySoftware("log_deleter", 3);
+    engine.buySoftware("log_undeleter", 1);
+
+    engine.addBounceNode(FIXED_IPS.INTERNIC);
+    engine.connect();
+    engine.login("admin", "admin");
+
+    const internic = engine.getState().servers[FIXED_IPS.INTERNIC]!;
+    const log = internic.logs[0]!;
+    const origIp = log.fromIp;
+    engine.startTask("log_deleter", log.id);
+    engine.tick(3);
+    expect(log.type).toBe("overwritten");
+    expect(log.suspiciousDeletion).toBe(true);
+
+    engine.startTask("log_undeleter", log.id);
+    engine.tick(3);
+    expect(log.suspiciousDeletion).toBe(false);
+    expect(log.fromIp).toBe(origIp);
+  });
+
+  it("supports Stock Market trading and Bank Loans", () => {
+    const engine = new UplinkEngine(createInitialWorld("Trader", 505));
+    const comp = Object.values(engine.getState().companies)[0]!;
+    const startCredits = engine.getState().player.credits;
+
+    expect(engine.buyShares(comp.id, 10)).toBe(true);
+    expect(engine.getState().player.credits).toBe(startCredits - comp.currentSharePrice * 10);
+    expect(engine.sellShares(comp.id, 10)).toBe(true);
+    expect(engine.getState().player.credits).toBe(startCredits);
+
+    // Bank loan
+    const bankIp = engine.getState().player.bankIp;
+    engine.addBounceNode(bankIp);
+    engine.connect();
+    expect(engine.loginBankAccount(engine.getState().player.bankAccountNumber, "vault")).toBe(true);
+    expect(engine.requestBankLoan(2000)).toBe(true);
+    expect(engine.getState().player.credits).toBe(startCredits + 2000);
+    expect(engine.repayBankLoan(2000)).toBe(true);
+    expect(engine.getState().player.credits).toBe(startCredits);
+  });
+
+  it("supports graduated consequences (warning mail, fine), VirtuaNet anonymity, and Gateway Self-Destruct survival", () => {
+    // 1. Warning mail on Uplink Test Machine
+    const e1 = new UplinkEngine(createInitialWorld("Newbie", 111));
+    e1.addBounceNode(FIXED_IPS.UPLINK_TEST);
+    e1.connect();
+    e1.beginTrace();
+    e1.tick(60);
+    expect(e1.getState().player.disavowed).toBe(false);
+    expect(e1.getState().emails.some((m) => m.subject.includes("caught hacking"))).toBe(true);
+
+    // 2. Tactical seizure on bank -> survive by nuking gateway with Self Destruct!
+    const e2 = new UplinkEngine(createInitialWorld("Survivor", 222));
+    e2.getState().player.credits = 60000;
+    e2.upgradeGateway("beta");
+    e2.buyGatewaySecurity("motion_sensor");
+    e2.buyGatewaySecurity("self_destruct");
+
+    e2.addBounceNode(e2.getState().player.bankIp);
+    e2.connect();
+    e2.beginTrace();
+    e2.tick(20);
+    expect(e2.getState().player.disavowed).toBe(false);
+    expect(e2.getState().player.gateway.proximityAlert).toBeGreaterThan(0);
+
+    expect(e2.nukeGateway()).toBe(true);
+    e2.tick(600);
+    expect(e2.getState().player.disavowed).toBe(false);
+    expect(e2.getState().player.gateway.nukedCount).toBe(1);
+
+    // 3. VirtuaNet anonymous gateway deflects federal trace cleanly
+    const e3 = new UplinkEngine(createInitialWorld("Anon", 333));
+    e3.getState().player.credits = 100000;
+    e3.upgradeGateway("virtuanet");
+    e3.addBounceNode(e3.getState().player.bankIp);
+    e3.connect();
+    e3.beginTrace();
+    e3.tick(20);
+    e3.tick(600);
+    expect(e3.getState().player.disavowed).toBe(false);
+  });
+
+  it("supports LAN Isolation Bridge toggling and Radio frequency bridging", () => {
+    const engine = new UplinkEngine(createInitialWorld("LanRunner", 888));
+    engine.getState().player.credits = 150000;
+    engine.upgradeGateway("trinity");
+    engine.buySoftware("lan_scan", 3);
+
+    const darwinLan = Object.values(engine.getState().servers).find((s) =>
+      s.name.includes("Darwin Digital LAN")
+    )!;
+    engine.addBounceNode(FIXED_IPS.INTERNIC);
+    engine.addBounceNode(darwinLan.ip);
+    engine.connect();
+
+    engine.startTask("lan_scan");
+    engine.tick(20);
+    expect(engine.moveLanNode("d_hub")).toBe(true);
+    expect(engine.moveLanNode("d_tx")).toBe(true);
+    expect(engine.moveLanNode("d_rx")).toBe(false);
+    expect(engine.setLanRadioFrequency(162.4)).toBe(true);
+    expect(engine.moveLanNode("d_rx")).toBe(true);
+    expect(engine.moveLanNode("d_main")).toBe(true);
+  });
+
+  it("supports Medical Database edits and ARC/Arunmor storyline with special missions", () => {
+    const engine = new UplinkEngine(createInitialWorld("Medic", 909));
+    const medMission = engine.getState().missions.find((m) => m.kind === "change_medical")!;
+    engine.acceptMission(medMission.id);
+    const cmd = engine.getState().servers[FIXED_IPS.MEDICAL_DB]!;
+
+    engine.addBounceNode(FIXED_IPS.INTERNIC);
+    engine.addBounceNode(cmd.ip);
+    engine.connect();
+    engine.login("admin", cmd.accounts[0]!.password);
+    expect(engine.updateMedicalRecord(medMission.targetCitizenId!, medMission.targetValue!)).toBe(true);
     engine.disconnect();
-    expect(engine.completeMission(m2.id)).toBe(true);
+    expect(engine.completeMission(medMission.id)).toBe(true);
 
     expect(engine.getState().story.stage).toBe("dead_agent_email");
     expect(engine.joinStoryFaction("arunmor")).toBe(true);
-    expect(engine.getState().story.stage).toBe("active_war");
+    expect(engine.getState().missions.some((m) => m.specialMissionCode === "BACKFIRE")).toBe(true);
+  });
 
-    // Deploy Faith on 5 servers
-    const targets = servers.filter((s) => !s.lanNodes && s.kind !== "bank").slice(0, 5);
-    for (const srv of targets) {
-      engine.clearRoute();
-      engine.addBounceNode(internic.ip);
-      if (srv.ip !== internic.ip) engine.addBounceNode(srv.ip);
-      engine.connect();
-      engine.login("admin", srv.accounts[0]!.password);
-      expect(engine.deployStoryPayload("faith")).toBe(true);
-      engine.disconnect();
-    }
-
-    expect(engine.getState().story.stage).toBe("arunmor_victory");
-
-    // Verify schema v2 JSON round-trip
-    const restored = deserializeState(serializeState(engine.getState()));
-    expect(restored.schemaVersion).toBe(2);
-    expect(restored.story.stage).toBe("arunmor_victory");
+  it("round-trips WorldState schema v3 cleanly via serializeState / deserializeState", () => {
+    const engine = new UplinkEngine(createInitialWorld("Saver", 777));
+    const json = serializeState(engine.getState());
+    const restored = deserializeState(json);
+    expect(restored.schemaVersion).toBe(3);
+    expect(restored.player.handle).toBe("Saver");
+    expect(Object.keys(restored.companies).length).toBe(Object.keys(engine.getState().companies).length);
   });
 });

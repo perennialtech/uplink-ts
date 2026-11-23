@@ -1,12 +1,20 @@
 import {
   CPU_CATALOG,
   DICTIONARY_WORDS,
+  FIXED_IPS,
   GATEWAY_CATALOG,
+  GATEWAY_SECURITY_CATALOG,
+  LOAN_TIERS,
+  MEMORY_CATALOG,
+  MODEM_CATALOG,
+  NEUROMANCER_MISSION_DELTA,
+  PLAYER_DEFAULTS,
   SECURITY_LEVEL_MODIFIER,
   SOFTWARE_CATALOG,
   TASK_TICKS,
   TRACE_BOUNCE_MODIFIER,
 } from "./catalog";
+import { createInitialConsole, executeConsoleCommand } from "./console";
 import { EventBus } from "./events";
 import {
   alertLanSysadmin,
@@ -14,12 +22,17 @@ import {
   createLanSession,
   isOnLanMainServer,
   nextStepToward,
+  toggleIsolationBridge,
+  tuneLanRadio,
 } from "./lan";
+import { stepMonthlySharePrices } from "./records";
 import { SeededRng } from "./rng";
-import { checkStoryTriggers } from "./story";
+import { checkStoryTriggers, spawnFactionStoryMissions } from "./story";
 import type {
   AccessLevel,
+  GatewaySecurityDevice,
   LogEntry,
+  Mission,
   RunningTask,
   ServerNode,
   SoftwareId,
@@ -56,11 +69,15 @@ export class UplinkEngine {
   }
 
   // ---------------------------------------------------------------------------
-  // Gateway & Memory Helpers
+  // Gateway, Hardware & Memory Helpers
   // ---------------------------------------------------------------------------
 
   getTotalCpuGhz(): number {
     return this.state.player.gateway.cpusGhz.reduce((sum, ghz) => sum + ghz, 0);
+  }
+
+  getEffectiveBandwidthGbps(): number {
+    return Math.min(this.state.player.gateway.modemGbps, this.state.player.gateway.bandwidthGbps);
   }
 
   getUsedMemoryGq(): number {
@@ -77,6 +94,14 @@ export class UplinkEngine {
     return best;
   }
 
+  hasHudUpgrade(id: "hud_map_show_trace" | "hud_connection_analysis" | "hud_lan_view" | "hud_irc_client"): boolean {
+    return this.getHighestSoftwareVersion(id) > 0;
+  }
+
+  hasSecurityDevice(dev: GatewaySecurityDevice): boolean {
+    return this.state.player.gateway.securityDevices.includes(dev);
+  }
+
   setTimeScale(scale: WorldState["timeScale"]): void {
     this.state.timeScale = scale;
   }
@@ -87,7 +112,8 @@ export class UplinkEngine {
 
   addBounceNode(ip: string): boolean {
     if (this.state.connection.connected) return false;
-    if (!this.state.servers[ip]) return false;
+    const srv = this.state.servers[ip];
+    if (!srv || srv.destroyed) return false;
     if (this.state.connection.route.includes(ip)) return false;
     this.state.connection.route.push(ip);
     return true;
@@ -113,7 +139,9 @@ export class UplinkEngine {
     if (this.state.connection.connected) return;
     this.state.connection.route = [
       this.state.player.gateway.ip,
-      ...this.state.player.savedBounceRoute.filter((ip) => Boolean(this.state.servers[ip])),
+      ...this.state.player.savedBounceRoute.filter(
+        (ip) => Boolean(this.state.servers[ip]) && !this.state.servers[ip]!.destroyed
+      ),
     ];
   }
 
@@ -121,6 +149,14 @@ export class UplinkEngine {
     const { route, connected } = this.state.connection;
     if (!connected || route.length < 2) return undefined;
     return this.state.servers[route[route.length - 1]!];
+  }
+
+  discoverServerByIp(ip: string): ServerNode | null {
+    const srv = this.state.servers[ip.trim()];
+    if (!srv) return null;
+    srv.discovered = true;
+    this.events.emit({ type: "notice", level: "info", message: `Resolved ${srv.ip} -> ${srv.name}` });
+    return srv;
   }
 
   computeBounceModifier(node: ServerNode): number {
@@ -161,18 +197,34 @@ export class UplinkEngine {
     const targetIp = route[route.length - 1]!;
     const target = this.state.servers[targetIp];
     if (!target) return false;
+    if (target.destroyed) {
+      this.events.emit({
+        type: "notice",
+        level: "error",
+        message: `${target.name} (${target.ip}) is offline (system destroyed).`,
+      });
+      return false;
+    }
 
     this.state.connection.connected = true;
     this.state.connection.authenticatedAs =
-      target.kind === "public_access" ? "user" : "none";
+      target.kind === "public_access" ||
+      target.kind === "uplink_public" ||
+      target.kind === "stock_market" ||
+      target.kind === "protovision"
+        ? "user"
+        : "none";
     delete this.state.connection.authenticatedUser;
     delete this.state.connection.authenticatedBankAccount;
+    this.state.connection.cypherPassed = !target.requiresCypher;
+    this.state.connection.voicePassed = !target.requiresVoiceAuth;
     this.state.connection.traceActive = false;
     this.state.connection.traceHopsCompleted = 0;
     this.state.connection.secondsUntilNextHop = 0;
     this.state.connection.totalTraceSecondsRemaining = 0;
     this.state.connection.totalTraceSecondsInitial = 0;
     this.state.connection.lanSession = createLanSession(target);
+    this.state.connection.console = createInitialConsole();
 
     for (let i = 1; i < route.length; i++) {
       const fromIp = route[i - 1]!;
@@ -213,6 +265,9 @@ export class UplinkEngine {
       (t) =>
         t.kind === "trace_tracker" ||
         t.kind === "decrypter" ||
+        t.kind === "defrag" ||
+        t.kind === "ip_lookup" ||
+        t.kind === "ip_probe" ||
         t.targetIp !== target.ip
     );
 
@@ -229,6 +284,8 @@ export class UplinkEngine {
     this.state.connection.authenticatedAs = "none";
     delete this.state.connection.authenticatedUser;
     delete this.state.connection.authenticatedBankAccount;
+    this.state.connection.cypherPassed = false;
+    this.state.connection.voicePassed = false;
     this.state.connection.traceActive = false;
     this.state.connection.traceHopsCompleted = 0;
     this.state.connection.secondsUntilNextHop = 0;
@@ -261,7 +318,51 @@ export class UplinkEngine {
   }
 
   // ---------------------------------------------------------------------------
-  // LAN Traversal
+  // Remote Admin Console
+  // ---------------------------------------------------------------------------
+
+  runConsoleCommand(command: string): string[] {
+    const target = this.getTargetServer();
+    if (!target) return ["Not connected to a remote server."];
+    if (this.state.connection.authenticatedAs !== "admin") {
+      return ["Access denied: Admin privileges required for console."];
+    }
+    if (this.isFirewallBlocking(target)) {
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: "Remote Firewall blocked console execution. Bypass or disable Firewall first.",
+      });
+      return ["Blocked by remote Firewall."];
+    }
+
+    const result = executeConsoleCommand(this.state.connection.console, target, command);
+    if (result.deletedSys || result.deletedUsr || result.deletedLogs) {
+      this.beginTrace();
+    }
+    if (result.runProgram === "revelation") {
+      this.deployStoryPayload("revelation");
+    } else if (result.runProgram === "faith") {
+      this.deployStoryPayload("faith");
+    }
+    if (result.shutdown) {
+      if (target.destroyed) {
+        this.state.news.unshift({
+          id: this.nextId("news"),
+          timestampMs: this.state.timeMs,
+          headline: `${target.companyName} System Destroyed in Cyber Attack`,
+          body: `Critical system files were erased on ${target.name} (${target.ip}) prior to forced shutdown.`,
+        });
+      }
+      this.disconnect();
+    } else if (result.disconnect) {
+      this.disconnect();
+    }
+    return result.output;
+  }
+
+  // ---------------------------------------------------------------------------
+  // LAN Traversal, Isolation Bridge & Radio
   // ---------------------------------------------------------------------------
 
   moveLanNode(targetNodeId: string): boolean {
@@ -278,9 +379,13 @@ export class UplinkEngine {
     session.currentNodeId = targetNodeId;
     const node = target.lanNodes.find((n) => n.id === targetNodeId);
     if (node) {
+      node.visibility = 3;
       for (const adjId of node.connectedTo) {
         const adj = target.lanNodes.find((n) => n.id === adjId);
-        if (adj) adj.visible = true;
+        if (adj) {
+          adj.visible = true;
+          adj.visibility = Math.max(adj.visibility, 2) as 0 | 1 | 2 | 3;
+        }
       }
       if (node.kind === "main_server") {
         alertLanSysadmin(target.lanNodes, session);
@@ -291,23 +396,82 @@ export class UplinkEngine {
     return true;
   }
 
+  flipLanIsolationBridge(bridgeNodeId: string): boolean {
+    const target = this.getTargetServer();
+    const session = this.state.connection.lanSession;
+    if (!target?.lanNodes || !session) return false;
+    if (session.currentNodeId !== bridgeNodeId) {
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: "Move to the Isolation Bridge node before toggling it.",
+      });
+      return false;
+    }
+    const res = toggleIsolationBridge(target.lanNodes, bridgeNodeId);
+    this.events.emit({ type: "notice", level: res.ok ? "info" : "warn", message: res.message });
+    return res.ok;
+  }
+
+  setLanRadioFrequency(freqMhz: number): boolean {
+    const target = this.getTargetServer();
+    const session = this.state.connection.lanSession;
+    if (!target?.lanNodes || !session) return false;
+    const cur = target.lanNodes.find((n) => n.id === session.currentNodeId);
+    if (!cur || cur.kind !== "radio_transmitter") {
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: "Move to the Radio Transmitter node to tune frequencies.",
+      });
+      return false;
+    }
+    const res = tuneLanRadio(target.lanNodes, session, freqMhz);
+    this.events.emit({ type: "notice", level: "info", message: res.message });
+    return res.ok;
+  }
+
   private isLanMainReady(target: ServerNode): boolean {
     if (!target.lanNodes) return true;
     return isOnLanMainServer(target.lanNodes, this.state.connection.lanSession);
   }
 
   // ---------------------------------------------------------------------------
-  // Authentication, Banks & Government Databases
+  // Authentication, High-Security Gates, Banks, Loans, Stocks & Gov DBs
   // ---------------------------------------------------------------------------
 
   login(username: string, password: string): boolean {
     const target = this.getTargetServer();
     if (!target) return false;
+    if (target.kind === "protovision") {
+      this.events.emit({
+        type: "notice",
+        level: "info",
+        message: "GREETINGS PROFESSOR FALKEN. SHALL WE PLAY A GAME? (Global Thermonuclear War)",
+      });
+      return false;
+    }
     if (!this.isLanMainReady(target)) {
       this.events.emit({
         type: "notice",
         level: "warn",
         message: "Reach the LAN Main Server before logging into admin.",
+      });
+      return false;
+    }
+    if (target.requiresCypher && !this.state.connection.cypherPassed) {
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: "Elliptic-Curve Cypher active. Run Decypher first.",
+      });
+      return false;
+    }
+    if (target.requiresVoiceAuth && !this.state.connection.voicePassed) {
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: `Voice Print required (${target.voiceAdminName ?? "Admin"}). Run Voice Analyser first.`,
       });
       return false;
     }
@@ -378,6 +542,9 @@ export class UplinkEngine {
     if (destAccountNumber === this.state.player.bankAccountNumber) {
       this.state.player.credits += amount;
     }
+    if (srcNum === this.state.player.bankAccountNumber) {
+      this.state.player.credits = Math.max(0, this.state.player.credits - amount);
+    }
 
     const outStmtId = this.nextId("stmt");
     const inStmtId = this.nextId("stmt");
@@ -404,12 +571,12 @@ export class UplinkEngine {
       detail: `Transfer ${amount}c from #${srcNum} to #${destAccountNumber}`,
     });
 
-    // If stealing from another person's account, schedule a bank audit!
+    // Original TIME_TOCOVERBANKROBBERY = 2 minutes!
     if (srcNum !== this.state.player.bankAccountNumber) {
       this.beginTrace();
       this.state.scheduledEvents.push({
         id: this.nextId("evt"),
-        triggerAtMs: this.state.timeMs + 2 * 3600 * 1000,
+        triggerAtMs: this.state.timeMs + 2 * 60 * 1000,
         kind: "bank_audit",
         payload: {
           bankIp: target.ip,
@@ -425,7 +592,63 @@ export class UplinkEngine {
     this.events.emit({
       type: "notice",
       level: "info",
-      message: `Transferred ${amount.toLocaleString()}c to #${destAccountNumber}. Delete BOTH statements before audit!`,
+      message: `Transferred ${amount.toLocaleString()}c to #${destAccountNumber}. Delete BOTH statements within 2 minutes!`,
+    });
+    return true;
+  }
+
+  requestBankLoan(amount: number): boolean {
+    const target = this.getTargetServer();
+    const acctNum = this.state.connection.authenticatedBankAccount;
+    if (!target || target.kind !== "bank" || acctNum !== this.state.player.bankAccountNumber) {
+      return false;
+    }
+    if (amount <= 0 || !Number.isFinite(amount)) return false;
+    const acct = target.bankAccounts.find((a) => a.accountNumber === acctNum);
+    if (!acct) return false;
+
+    const maxLoan = acct.creditRating * 1000;
+    if (acct.loan + amount > maxLoan) {
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: `Loan denied. Max credit line is ${maxLoan.toLocaleString()}c (current loan: ${acct.loan.toLocaleString()}c).`,
+      });
+      return false;
+    }
+
+    acct.loan += amount;
+    acct.balance += amount;
+    this.state.player.credits += amount;
+    this.events.emit({
+      type: "notice",
+      level: "info",
+      message: `Approved loan of ${amount.toLocaleString()}c (Total debt: ${acct.loan.toLocaleString()}c).`,
+    });
+    return true;
+  }
+
+  repayBankLoan(amount: number): boolean {
+    const target = this.getTargetServer();
+    const acctNum = this.state.connection.authenticatedBankAccount;
+    if (!target || target.kind !== "bank" || acctNum !== this.state.player.bankAccountNumber) {
+      return false;
+    }
+    const acct = target.bankAccounts.find((a) => a.accountNumber === acctNum);
+    if (!acct || acct.loan <= 0) return false;
+    const pay = Math.min(amount, acct.loan, this.state.player.credits);
+    if (pay <= 0) return false;
+
+    acct.loan -= pay;
+    acct.balance = Math.max(0, acct.balance - pay);
+    this.state.player.credits -= pay;
+    if (acct.loan === 0) {
+      acct.creditRating = Math.min(15, acct.creditRating + 1);
+    }
+    this.events.emit({
+      type: "notice",
+      level: "info",
+      message: `Repaid ${pay.toLocaleString()}c of bank loan (Remaining: ${acct.loan.toLocaleString()}c).`,
     });
     return true;
   }
@@ -463,15 +686,76 @@ export class UplinkEngine {
     const outStillThere = Boolean(vAcct?.statements.some((s) => s.id === outStmtId));
     const inStillThere = Boolean(dAcct?.statements.some((s) => s.id === inStmtId));
 
-    // Player is caught if EITHER transfer statement remains on record!
     if ((outStillThere || inStillThere) && destAccount === this.state.player.bankAccountNumber) {
-      this.disavowPlayer(
-        `Bank audit at ${victimBank?.name ?? bankIp} matched an undeleted transfer statement to your account #${destAccount}.`
+      this.scheduleGatewaySeizure(
+        `Bank audit at ${victimBank?.name ?? bankIp} matched an undeleted transfer statement to account #${destAccount}.`,
+        5 * 60 * 1000
       );
       return true;
     }
     return false;
   }
+
+  // ---------------------------------------------------------------------------
+  // International Stock Market System
+  // ---------------------------------------------------------------------------
+
+  buyShares(companyId: string, shares: number): boolean {
+    if (shares <= 0 || !Number.isInteger(shares)) return false;
+    const comp = this.state.companies[companyId];
+    if (!comp) return false;
+    const totalCost = comp.currentSharePrice * shares;
+    if (this.state.player.credits < totalCost) {
+      this.events.emit({ type: "notice", level: "warn", message: "Insufficient credits for share purchase." });
+      return false;
+    }
+
+    this.state.player.credits -= totalCost;
+    const existing = this.state.player.portfolio.find((p) => p.companyId === companyId);
+    if (existing) {
+      const totalShares = existing.shares + shares;
+      existing.avgPurchasePrice = Math.round(
+        (existing.avgPurchasePrice * existing.shares + totalCost) / totalShares
+      );
+      existing.shares = totalShares;
+    } else {
+      this.state.player.portfolio.push({
+        companyId,
+        shares,
+        avgPurchasePrice: comp.currentSharePrice,
+      });
+    }
+    this.events.emit({
+      type: "notice",
+      level: "info",
+      message: `Purchased ${shares} shares of ${comp.name} @ ${comp.currentSharePrice}c.`,
+    });
+    return true;
+  }
+
+  sellShares(companyId: string, shares: number): boolean {
+    if (shares <= 0 || !Number.isInteger(shares)) return false;
+    const comp = this.state.companies[companyId];
+    const holding = this.state.player.portfolio.find((p) => p.companyId === companyId);
+    if (!comp || !holding || holding.shares < shares) return false;
+
+    const proceeds = comp.currentSharePrice * shares;
+    this.state.player.credits += proceeds;
+    holding.shares -= shares;
+    if (holding.shares === 0) {
+      this.state.player.portfolio = this.state.player.portfolio.filter((p) => p.companyId !== companyId);
+    }
+    this.events.emit({
+      type: "notice",
+      level: "info",
+      message: `Sold ${shares} shares of ${comp.name} for ${proceeds.toLocaleString()}c.`,
+    });
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Government Databases (Academic, Criminal, Social, Medical)
+  // ---------------------------------------------------------------------------
 
   updateAcademicRecord(citizenId: string, newGpa: string): boolean {
     const target = this.getTargetServer();
@@ -505,7 +789,7 @@ export class UplinkEngine {
       cit.criminalHistory = [];
       cit.arrestWarrant = false;
     } else if (action === "add_crime") {
-      cit.criminalHistory.push(detail ?? "High-security cyber intrusion");
+      cit.criminalHistory.push(detail ?? "Unauthorised high-security cyber intrusion");
     } else if (action === "warrant") {
       cit.arrestWarrant = true;
     }
@@ -532,6 +816,23 @@ export class UplinkEngine {
     return true;
   }
 
+  updateMedicalRecord(citizenId: string, entry: string): boolean {
+    const target = this.getTargetServer();
+    if (!target || target.kind !== "database_medical" || this.state.connection.authenticatedAs === "none") {
+      return false;
+    }
+    if (this.isProxyBlocking(target)) {
+      this.events.emit({ type: "notice", level: "warn", message: "Proxy blocked database edit." });
+      return false;
+    }
+    const cit = this.state.citizens[citizenId];
+    if (!cit) return false;
+    cit.medicalHistory.unshift(entry);
+    this.beginTrace();
+    this.events.emit({ type: "notice", level: "info", message: `Updated medical record for ${cit.fullName}.` });
+    return true;
+  }
+
   // ---------------------------------------------------------------------------
   // Storyline (ARC vs. Arunmor — Revelation & Faith)
   // ---------------------------------------------------------------------------
@@ -540,11 +841,18 @@ export class UplinkEngine {
     if (this.state.story.stage !== "dead_agent_email") return false;
     this.state.story.faction = faction;
     this.state.story.stage = "active_war";
+    this.state.story.act = 2;
+    this.state.story.scene = 1;
 
     const swId: SoftwareId = faction === "arc" ? "revelation" : "faith";
     if (this.getHighestSoftwareVersion(swId) === 0) {
       this.state.player.gateway.software.push({ id: swId, version: 1, sizeGq: 2 });
     }
+    if (this.getHighestSoftwareVersion("revelation_tracker") === 0) {
+      this.state.player.gateway.software.push({ id: "revelation_tracker", version: 1, sizeGq: 1 });
+    }
+
+    spawnFactionStoryMissions(this.state, faction, (p) => this.nextId(p));
 
     const headline =
       faction === "arc"
@@ -556,8 +864,8 @@ export class UplinkEngine {
       headline,
       body:
         faction === "arc"
-          ? "Connect to corporate servers with admin access and deploy Revelation to infect 5 systems."
-          : "Connect to corporate servers with admin access and deploy Faith to harden/purge 5 systems.",
+          ? "Special ARC missions added to your contract board. Run Revelation on corporate hosts."
+          : "Special Arunmor missions added to your contract board. Deploy Faith to purge infected hosts.",
     });
     this.events.emit({ type: "story.updated", stage: this.state.story.stage, headline });
     return true;
@@ -571,18 +879,22 @@ export class UplinkEngine {
     if (payload === "revelation") {
       if (target.revelationInfected) return false;
       target.revelationInfected = true;
+      target.revelationVersion = this.state.story.revelationVersion;
       target.faithProtected = false;
       this.state.story.revelationCount += 1;
+      this.state.story.revelationVersion = Math.round((this.state.story.revelationVersion + 0.4) * 10) / 10;
       this.state.player.neuromancerScore -= 40;
       this.beginTrace();
     } else {
       if (target.faithProtected) return false;
       target.faithProtected = true;
+      target.faithVersion = this.state.story.faithVersion;
       if (target.revelationInfected) {
         target.revelationInfected = false;
         this.state.story.revelationCount = Math.max(0, this.state.story.revelationCount - 1);
       }
       this.state.story.faithCount += 1;
+      this.state.story.faithVersion = Math.round((this.state.story.faithVersion + 0.4) * 10) / 10;
       this.state.player.neuromancerScore += 40;
     }
 
@@ -599,12 +911,190 @@ export class UplinkEngine {
   }
 
   // ---------------------------------------------------------------------------
-  // Helpers
+  // Gateway Self-Destruct (Nuke) & Consequences
+  // ---------------------------------------------------------------------------
+
+  nukeGateway(): boolean {
+    if (this.state.player.disavowed) return false;
+    if (!this.hasSecurityDevice("self_destruct")) {
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: "Install Gateway Self Destruct hardware first.",
+      });
+      return false;
+    }
+
+    if (this.state.connection.connected) {
+      this.disconnect();
+    }
+
+    // Cancel all pending gateway seizure events for this gateway ID (original gatewaynuke.cpp!)
+    const hadSeizure = this.state.scheduledEvents.some(
+      (e) => e.kind === "seize_gateway" || e.kind === "seize_warning"
+    );
+    this.state.scheduledEvents = this.state.scheduledEvents.filter(
+      (e) => e.kind !== "seize_gateway" && e.kind !== "seize_warning"
+    );
+
+    const gw = this.state.player.gateway;
+    gw.gatewayIdNumber += 1;
+    gw.nukedCount += 1;
+    gw.proximityAlert = 0;
+    gw.specId = "alpha";
+    gw.cpusGhz = [PLAYER_DEFAULTS.startCpuGhz];
+    gw.memoryTotalGq = PLAYER_DEFAULTS.startMemoryGq;
+    gw.modemGbps = PLAYER_DEFAULTS.startBandwidthGbps;
+    gw.bandwidthGbps = PLAYER_DEFAULTS.startBandwidthGbps;
+    gw.securityDevices = [];
+    gw.files = [];
+    gw.software = [
+      { id: "password_breaker", version: 1, sizeGq: 2 },
+      { id: "trace_tracker", version: 2, sizeGq: 1 },
+      { id: "file_copier", version: 1, sizeGq: 1 },
+      { id: "file_deleter", version: 1, sizeGq: 1 },
+      { id: "log_deleter", version: 1, sizeGq: 1 },
+    ];
+    this.state.player.credits = Math.max(0, this.state.player.credits - PLAYER_DEFAULTS.newGatewayCost);
+
+    if (hadSeizure) {
+      this.state.player.neuromancerScore += 150;
+      this.state.player.uplinkScore = Math.max(1, this.state.player.uplinkScore - 30);
+    }
+
+    this.state.news.unshift({
+      id: this.nextId("news"),
+      timestampMs: this.state.timeMs,
+      headline: "Federal Raid Finds Only Destroyed Hardware",
+      body: "Authorities arrived at a suspected Uplink gateway location only to find the chassis vaporized by an explosive charge.",
+    });
+
+    this.events.emit({ type: "gateway.nuked", newGatewayId: gw.gatewayIdNumber });
+    return true;
+  }
+
+  private handleCaughtHacking(target: ServerNode, reason: string): void {
+    const gwSpec = GATEWAY_CATALOG.find((g) => g.id === this.state.player.gateway.specId);
+    // VirtuaNet anonymous gateway: clean disconnect, no arrest (original consequencegenerator.cpp!)
+    if (gwSpec?.anonymous) {
+      if (this.state.connection.connected) this.disconnect();
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: "VirtuaNet Anonymous Gateway deflected federal trace. Connection severed cleanly.",
+      });
+      return;
+    }
+
+    if (this.state.connection.connected) {
+      this.disconnect();
+    }
+
+    if (target.traceAction === "warning_mail" || target.traceAction === "disconnect") {
+      // Rotate admin password & send warning email
+      const admin = target.accounts.find((a) => a.username === "admin");
+      if (admin) admin.password = this.rng.pick(DICTIONARY_WORDS);
+      this.state.emails.unshift({
+        id: this.nextId("email"),
+        from: `security@${target.companyName.toLowerCase().replace(/[^a-z0-9]+/g, "")}.com`,
+        subject: "You were caught hacking our computer systems",
+        body: `Our system administrator traced an unauthorised connection on ${target.name} (${target.ip}). We have disconnected you and rotated access codes. Future intrusions will incur legal action.`,
+        timestampMs: this.state.timeMs,
+        read: false,
+      });
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: `Traced on ${target.name}: disconnected and issued formal warning email.`,
+      });
+      return;
+    }
+
+    if (target.traceAction === "fine") {
+      const fineAmount = 2000;
+      const dueDateMs = this.state.timeMs + 7 * 24 * 3600 * 1000;
+      const missionId = this.nextId("fine");
+      this.state.missions.unshift({
+        id: missionId,
+        kind: "pay_fine",
+        title: `Pay Legal Fine (${fineAmount.toLocaleString()}c) — ${target.companyName}`,
+        employer: target.companyName,
+        description: `${reason} Pay ${fineAmount.toLocaleString()}c within 7 days to avoid gateway seizure.`,
+        difficulty: 1,
+        payment: -fineAmount,
+        minUplinkRating: 0,
+        targetIp: target.ip,
+        targetAmount: fineAmount,
+        dueDateMs,
+        accepted: true,
+        completed: false,
+      });
+      this.state.scheduledEvents.push({
+        id: this.nextId("evt"),
+        triggerAtMs: dueDateMs,
+        kind: "fine_due",
+        payload: { missionId, company: target.companyName },
+      });
+      this.state.player.uplinkScore = Math.max(1, this.state.player.uplinkScore - 2);
+      this.events.emit({
+        type: "notice",
+        level: "error",
+        message: `Traced on ${target.name}: issued ${fineAmount.toLocaleString()}c fine (due in 7 days).`,
+      });
+      return;
+    }
+
+    // Legal (3 hours) or Tactical (5 minutes) -> schedule SeizeGatewayEvent with warning
+    const delayMs = target.traceAction === "tactical" ? 5 * 60 * 1000 : 3 * 3600 * 1000;
+    this.scheduleGatewaySeizure(reason, delayMs);
+  }
+
+  private scheduleGatewaySeizure(reason: string, delayMs: number): void {
+    const triggerAtMs = this.state.timeMs + delayMs;
+    const warnAtMs = Math.max(this.state.timeMs, triggerAtMs - 60 * 1000);
+    const gwId = this.state.player.gateway.gatewayIdNumber;
+
+    this.state.scheduledEvents.push({
+      id: this.nextId("evt"),
+      triggerAtMs: warnAtMs,
+      kind: "seize_warning",
+      payload: { reason, gatewayId: gwId },
+    });
+    this.state.scheduledEvents.push({
+      id: this.nextId("evt"),
+      triggerAtMs,
+      kind: "seize_gateway",
+      payload: { reason, gatewayId: gwId },
+    });
+
+    if (this.hasSecurityDevice("motion_sensor")) {
+      this.state.player.gateway.proximityAlert += 1;
+      this.events.emit({
+        type: "gateway.proximity",
+        count: this.state.player.gateway.proximityAlert,
+        reason: "Motion Sensor: Federal agents en route to your gateway! Nuke gateway to escape.",
+      });
+    } else {
+      this.events.emit({
+        type: "notice",
+        level: "error",
+        message: `CRITICAL: Trace completed (${reason}). Federal seizure warrant active!`,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Security Helpers
   // ---------------------------------------------------------------------------
 
   private isProxyBlocking(server: ServerNode): boolean {
     const proxy = server.security.find((s) => s.kind === "proxy");
     return Boolean(proxy && proxy.enabled && !proxy.bypassed);
+  }
+
+  private isFirewallBlocking(server: ServerNode): boolean {
+    const fw = server.security.find((s) => s.kind === "firewall");
+    return Boolean(fw && fw.enabled && !fw.bypassed);
   }
 
   private appendLog(
@@ -641,7 +1131,14 @@ export class UplinkEngine {
     }
 
     const target = this.getTargetServer();
-    if (kind !== "trace_tracker" && kind !== "decrypter" && !target) {
+    const localOnly =
+      kind === "trace_tracker" ||
+      kind === "decrypter" ||
+      kind === "defrag" ||
+      kind === "ip_lookup" ||
+      kind === "ip_probe";
+
+    if (!localOnly && !target) {
       this.events.emit({
         type: "notice",
         level: "warn",
@@ -687,9 +1184,30 @@ export class UplinkEngine {
       }
       task.meta = { fileSizeGq: localFile.sizeGq, fileName: localFile.name, ticksDone: 0 };
       task.statusText = `Decrypting ${localFile.name}...`;
+    } else if (kind === "defrag") {
+      task.meta = { totalTicks: Math.max(20, this.state.player.gateway.memoryTotalGq * TASK_TICKS.defragPerGq), ticksDone: 0 };
+      task.statusText = "Defragmenting gateway memory banks...";
+    } else if (kind === "ip_lookup") {
+      if (!targetRef) return null;
+      task.meta = { ip: targetRef.trim(), ticksDone: 0 };
+      task.statusText = `Resolving ${targetRef.trim()}...`;
+    } else if (kind === "ip_probe") {
+      const probeIp = targetRef ?? target?.ip;
+      if (!probeIp || !this.state.servers[probeIp]) return null;
+      task.targetIp = probeIp;
+      task.meta = { ip: probeIp, ticksDone: 0 };
+      task.statusText = `Probing ${probeIp} (v${version}.0)...`;
     } else if (target) {
-      if (kind === "password_breaker" || kind === "dictionary_hacker") {
-        // Support cracking either admin account OR a bank account number
+      if (kind === "decypher") {
+        if (!target.requiresCypher || this.state.connection.cypherPassed) return null;
+        const level = target.cypherLevel ?? 1;
+        task.meta = { totalTicks: Math.max(40, (TASK_TICKS.decypherBase * level) / version), ticksDone: 0 };
+        task.statusText = `Breaking Elliptic-Curve Cypher (L${level})...`;
+        this.beginTrace();
+      } else if (kind === "voice_analyser") {
+        task.meta = { adminName: target.voiceAdminName ?? "Administrator", ticksDone: 0 };
+        task.statusText = `Synthesizing voiceprint (${target.voiceAdminName ?? "Admin"})...`;
+      } else if (kind === "password_breaker" || kind === "dictionary_hacker") {
         const bankAcct =
           target.kind === "bank" && targetRef
             ? target.bankAccounts.find((a) => a.accountNumber === targetRef)
@@ -721,6 +1239,16 @@ export class UplinkEngine {
         task.statusText = `Cracking ${acct.username}: ${"*".repeat(acct.password.length)}`;
         this.beginTrace();
       } else if (kind === "proxy_disable" || kind === "firewall_disable") {
+        const secKind = kind === "proxy_disable" ? "proxy" : "firewall";
+        const sec = target.security.find((s) => s.kind === secKind);
+        if (sec && sec.level > version) {
+          this.events.emit({
+            type: "notice",
+            level: "warn",
+            message: `${secKind.toUpperCase()} Level ${sec.level} requires Disable v${sec.level}.0+.`,
+          });
+          return null;
+        }
         this.beginTrace();
         task.statusText = kind === "proxy_disable" ? "Disabling Proxy..." : "Disabling Firewall...";
       } else if (kind === "proxy_bypass" || kind === "firewall_bypass" || kind === "monitor_bypass") {
@@ -736,6 +1264,14 @@ export class UplinkEngine {
       } else if (kind === "file_copier" || kind === "file_deleter") {
         if (this.state.connection.authenticatedAs === "none") {
           this.events.emit({ type: "notice", level: "warn", message: "Authenticate first." });
+          return null;
+        }
+        if (this.isFirewallBlocking(target)) {
+          this.events.emit({
+            type: "notice",
+            level: "warn",
+            message: "Remote Firewall blocked file transfer. Bypass or disable Firewall first.",
+          });
           return null;
         }
         if (kind === "file_deleter" && this.isProxyBlocking(target)) {
@@ -767,6 +1303,14 @@ export class UplinkEngine {
           this.events.emit({ type: "notice", level: "warn", message: "Admin access required." });
           return null;
         }
+        if (this.isProxyBlocking(target)) {
+          this.events.emit({
+            type: "notice",
+            level: "warn",
+            message: "Remote Proxy blocked log modification.",
+          });
+          return null;
+        }
         const log = target.logs.find((l) => l.id === targetRef);
         if (!log) return null;
         task.meta = { ticksDone: 0, newFromIp: extraRef ?? "198.51.100.77" };
@@ -779,7 +1323,7 @@ export class UplinkEngine {
       } else if (kind === "lan_scan" || kind === "lan_probe" || kind === "lan_spoof" || kind === "lan_force") {
         if (!target.lanNodes) return null;
         task.meta = { ticksDone: 0 };
-        task.statusText = `${kind.replace(/_/g, " ").toUpperCase()}...`;
+        task.statusText = `${kind.replace(/_/g, " ").toUpperCase()} (v${version}.0)...`;
       }
     } else if (kind === "trace_tracker") {
       task.statusText = "No active trace";
@@ -885,7 +1429,7 @@ export class UplinkEngine {
         conn.traceActive = false;
         conn.totalTraceSecondsRemaining = 0;
         this.events.emit({ type: "trace.completed", targetIp: target.ip });
-        this.disavowPlayer(`Active trace completed by ${target.name} (${target.ip}).`);
+        this.handleCaughtHacking(target, `Active trace completed by ${target.name} (${target.ip}).`);
         return;
       }
 
@@ -928,13 +1472,105 @@ export class UplinkEngine {
         continue;
       }
 
+      if (task.kind === "defrag" && task.meta) {
+        const totalTicks = Number(task.meta.totalTicks ?? 72);
+        const ticksDone = Number(task.meta.ticksDone ?? 0) + ticks;
+        task.meta.ticksDone = ticksDone;
+        task.progress = Math.min(1, ticksDone / totalTicks);
+        if (task.progress >= 1) {
+          task.completed = true;
+          this.events.emit({
+            type: "task.completed",
+            taskId: task.id,
+            kind: task.kind,
+            summary: "Gateway memory banks defragmented.",
+          });
+          completedIds.push(task.id);
+        }
+        continue;
+      }
+
+      if (task.kind === "ip_lookup" && task.meta) {
+        const ticksDone = Number(task.meta.ticksDone ?? 0) + ticks;
+        task.meta.ticksDone = ticksDone;
+        task.progress = Math.min(1, ticksDone / TASK_TICKS.ipLookup);
+        if (task.progress >= 1) {
+          const ip = String(task.meta.ip ?? "");
+          const found = this.discoverServerByIp(ip);
+          task.completed = true;
+          this.events.emit({
+            type: "task.completed",
+            taskId: task.id,
+            kind: task.kind,
+            summary: found ? `IP Lookup: ${found.name} (${found.ip}) added.` : `IP Lookup: ${ip} not found.`,
+          });
+          completedIds.push(task.id);
+        }
+        continue;
+      }
+
+      if (task.kind === "ip_probe" && task.meta) {
+        const ticksDone = Number(task.meta.ticksDone ?? 0) + ticks;
+        task.meta.ticksDone = ticksDone;
+        task.progress = Math.min(1, ticksDone / TASK_TICKS.ipProbe);
+        if (task.progress >= 1) {
+          const srv = this.state.servers[String(task.meta.ip ?? "")];
+          if (srv) {
+            srv.probedLevel = Math.max(srv.probedLevel, task.version);
+          }
+          task.completed = true;
+          this.events.emit({
+            type: "task.completed",
+            taskId: task.id,
+            kind: task.kind,
+            summary: srv
+              ? `IP Probe v${task.version}: ${srv.security.length} security system(s) on ${srv.name}.`
+              : "IP Probe failed.",
+          });
+          completedIds.push(task.id);
+        }
+        continue;
+      }
+
       const target = this.state.servers[task.targetIp];
       if (!target) {
         completedIds.push(task.id);
         continue;
       }
 
-      if ((task.kind === "password_breaker" || task.kind === "dictionary_hacker") && task.meta) {
+      if (task.kind === "decypher" && task.meta) {
+        const totalTicks = Number(task.meta.totalTicks ?? 140);
+        const ticksDone = Number(task.meta.ticksDone ?? 0) + ticks;
+        task.meta.ticksDone = ticksDone;
+        task.progress = Math.min(1, ticksDone / totalTicks);
+        if (task.progress >= 1) {
+          this.state.connection.cypherPassed = true;
+          task.completed = true;
+          this.events.emit({
+            type: "task.completed",
+            taskId: task.id,
+            kind: task.kind,
+            summary: "Elliptic-Curve Cypher bypassed.",
+          });
+          completedIds.push(task.id);
+        }
+      } else if (task.kind === "voice_analyser" && task.meta) {
+        const ticksDone = Number(task.meta.ticksDone ?? 0) + ticks;
+        task.meta.ticksDone = ticksDone;
+        task.progress = Math.min(1, ticksDone / TASK_TICKS.voiceAnalyse);
+        if (task.progress >= 1) {
+          this.state.connection.voicePassed = true;
+          this.state.player.recordedVoiceAdmin = String(task.meta.adminName ?? "Admin");
+          task.completed = true;
+          this.events.emit({
+            type: "task.completed",
+            taskId: task.id,
+            kind: task.kind,
+            summary: `Voiceprint synthesized for ${String(task.meta.adminName)}.`,
+          });
+          completedIds.push(task.id);
+        }
+      } else if ((task.kind === "password_breaker" || task.kind === "dictionary_hacker") && task.meta) {
         const totalTicks = Number(task.meta.totalTicks ?? 100);
         const password = String(task.meta.password ?? "");
         const username = String(task.meta.username ?? "admin");
@@ -983,7 +1619,8 @@ export class UplinkEngine {
         }
       } else if (task.kind === "file_copier" && task.meta) {
         const sizeGq = Number(task.meta.fileSizeGq ?? 1);
-        const totalTicks = Math.max(10, sizeGq * TASK_TICKS.copyPerGq);
+        const bwBonus = Math.max(1, this.getEffectiveBandwidthGbps());
+        const totalTicks = Math.max(10, (sizeGq * TASK_TICKS.copyPerGq) / Math.sqrt(bwBonus));
         const ticksDone = Number(task.meta.ticksDone ?? 0) + ticks;
         task.meta.ticksDone = ticksDone;
         task.progress = Math.min(1, ticksDone / totalTicks);
@@ -1045,13 +1682,26 @@ export class UplinkEngine {
             const log = target.logs[logIdx]!;
             if (task.version >= 4) {
               target.logs.splice(logIdx, 1);
+            } else if (task.version === 3) {
+              log.suspiciousDeletion = true;
+              log.deletionTier = 3;
+              log.originalDetail = log.detail;
+              log.originalFromIp = log.fromIp;
+              if (log.toIp) log.originalToIp = log.toIp;
+              log.type = "overwritten";
+              log.fromIp = "203.0.113.42";
+              log.detail = "Connection from 203.0.113.42 routed to 198.51.100.12 [decoy]";
             } else {
               log.suspiciousDeletion = true;
+              log.deletionTier = task.version === 2 ? 2 : 1;
               log.originalDetail = log.detail;
               log.originalFromIp = log.fromIp;
               if (log.toIp) log.originalToIp = log.toIp;
               log.type = "deleted";
-              log.detail = `[Log deleted — recoverable stub]`;
+              log.detail =
+                task.version === 2
+                  ? "[Blank log space — recoverable]"
+                  : "[Log deleted — recoverable stub]";
             }
           }
           task.completed = true;
@@ -1059,7 +1709,12 @@ export class UplinkEngine {
             type: "task.completed",
             taskId: task.id,
             kind: task.kind,
-            summary: task.version >= 4 ? "Log cleanly wiped (v4)" : "Log blanked (recoverable stub)",
+            summary:
+              task.version >= 4
+                ? "Log cleanly wiped (v4)"
+                : task.version === 3
+                  ? "Log overwritten with decoy (v3)"
+                  : `Log blanked (v${task.version})`,
           });
           completedIds.push(task.id);
         }
@@ -1071,6 +1726,7 @@ export class UplinkEngine {
           const log = target.logs.find((l) => l.id === task.targetRef);
           if (log && log.suspiciousDeletion) {
             log.suspiciousDeletion = false;
+            delete log.deletionTier;
             log.type = log.originalToIp ? "bounce" : "connection";
             log.detail = log.originalDetail ?? log.detail;
             log.fromIp = log.originalFromIp ?? log.fromIp;
@@ -1131,15 +1787,20 @@ export class UplinkEngine {
         task.meta.ticksDone = ticksDone;
         task.progress = Math.min(1, ticksDone / TASK_TICKS.lanScan);
         if (task.progress >= 1) {
+          let found = 0;
           for (const node of target.lanNodes) {
-            node.visible = true;
+            if (node.security <= task.version) {
+              node.visible = true;
+              node.visibility = Math.max(node.visibility, 2) as 0 | 1 | 2 | 3;
+              found += 1;
+            }
           }
           task.completed = true;
           this.events.emit({
             type: "task.completed",
             taskId: task.id,
             kind: task.kind,
-            summary: `Discovered ${target.lanNodes.length} LAN nodes`,
+            summary: `LAN Scan v${task.version} revealed ${found} node(s)`,
           });
           completedIds.push(task.id);
         }
@@ -1151,9 +1812,13 @@ export class UplinkEngine {
           const node = target.lanNodes.find((n) => n.id === task.targetRef);
           if (node) {
             node.probed = true;
+            node.visibility = 3;
             for (const adjId of node.connectedTo) {
               const adj = target.lanNodes.find((n) => n.id === adjId);
-              if (adj) adj.visible = true;
+              if (adj) {
+                adj.visible = true;
+                adj.visibility = Math.max(adj.visibility, 2) as 0 | 1 | 2 | 3;
+              }
             }
           }
           task.completed = true;
@@ -1171,8 +1836,9 @@ export class UplinkEngine {
         task.progress = Math.min(1, ticksDone / TASK_TICKS.lanSpoof);
         if (task.progress >= 1) {
           const node = target.lanNodes.find((n) => n.id === task.targetRef);
-          if (node) {
+          if (node && node.security <= task.version) {
             node.spoofed = true;
+            this.state.connection.lanSession?.spoofedNodeIds.push(node.id);
             for (const locked of target.lanNodes) {
               if (locked.requiresNodeId === node.id) locked.unlocked = true;
             }
@@ -1182,7 +1848,10 @@ export class UplinkEngine {
             type: "task.completed",
             taskId: task.id,
             kind: task.kind,
-            summary: `Spoofed ${node?.label ?? "node"} — dependent locks unlocked`,
+            summary:
+              node && node.security <= task.version
+                ? `Spoofed ${node.label} — dependent locks unlocked`
+                : `LAN Spoof v${task.version} insufficient for target security level`,
           });
           completedIds.push(task.id);
         }
@@ -1192,7 +1861,9 @@ export class UplinkEngine {
         task.progress = Math.min(1, ticksDone / TASK_TICKS.lanForce);
         if (task.progress >= 1) {
           const node = target.lanNodes.find((n) => n.id === task.targetRef);
-          if (node) node.unlocked = true;
+          if (node && node.security <= task.version) {
+            node.unlocked = true;
+          }
           if (this.state.connection.lanSession) {
             alertLanSysadmin(target.lanNodes, this.state.connection.lanSession);
             this.events.emit({ type: "lan.sysadmin_alert", nodeId: node?.id ?? "" });
@@ -1266,8 +1937,99 @@ export class UplinkEngine {
         this.runPassiveTraceAudit(String(evt.payload.targetIp ?? ""));
       } else if (evt.kind === "bank_audit") {
         this.runBankAudit(evt.payload);
+      } else if (evt.kind === "seize_warning") {
+        if (Number(evt.payload.gatewayId) === this.state.player.gateway.gatewayIdNumber) {
+          this.state.player.gateway.proximityAlert += 1;
+          this.events.emit({
+            type: "gateway.proximity",
+            count: this.state.player.gateway.proximityAlert,
+            reason: "IMMINENT RAID: Federal agents are at your gateway door! Nuke now to survive.",
+          });
+        }
+      } else if (evt.kind === "seize_gateway") {
+        if (Number(evt.payload.gatewayId) === this.state.player.gateway.gatewayIdNumber) {
+          this.disavowPlayer(String(evt.payload.reason ?? "Gateway seized by federal agents."));
+        }
+      } else if (evt.kind === "fine_due") {
+        const fineMission = this.state.missions.find((m) => m.id === String(evt.payload.missionId));
+        if (fineMission && !fineMission.completed) {
+          fineMission.failed = true;
+          this.scheduleGatewaySeizure(
+            `Failed to pay legal fine to ${String(evt.payload.company)}.`,
+            3 * 3600 * 1000
+          );
+        }
+      } else if (evt.kind === "mission_refresh") {
+        this.generateDynamicMission();
+        this.state.scheduledEvents.push({
+          id: this.nextId("evt"),
+          triggerAtMs: this.state.timeMs + 12 * 3600 * 1000,
+          kind: "mission_refresh",
+          payload: {},
+        });
+      } else if (evt.kind === "monthly_billing") {
+        this.processMonthlyBilling();
+        this.state.scheduledEvents.push({
+          id: this.nextId("evt"),
+          triggerAtMs: this.state.timeMs + 30 * 24 * 3600 * 1000,
+          kind: "monthly_billing",
+          payload: {},
+        });
       }
     }
+  }
+
+  private processMonthlyBilling(): void {
+    // Deduct monthly Uplink fee (300c)
+    this.state.player.credits = Math.max(0, this.state.player.credits - PLAYER_DEFAULTS.monthlyFee);
+    // Apply loan interest
+    const bank = this.state.servers[this.state.player.bankIp];
+    const acct = bank?.bankAccounts.find((a) => a.accountNumber === this.state.player.bankAccountNumber);
+    if (acct && acct.loan > 0) {
+      const tier = LOAN_TIERS.find((t) => acct.loan <= t.maxAmount) ?? LOAN_TIERS[LOAN_TIERS.length - 1]!;
+      const interest = Math.round((acct.loan * tier.interestRate) / 12);
+      acct.loan += interest;
+    }
+    // Step stock market monthly prices
+    stepMonthlySharePrices(this.state.companies, this.rng);
+    this.events.emit({
+      type: "notice",
+      level: "info",
+      message: `Monthly Uplink fee (${PLAYER_DEFAULTS.monthlyFee}c) billed; Stock Market prices updated.`,
+    });
+  }
+
+  private generateDynamicMission(): void {
+    const activeCount = this.state.missions.filter((m) => !m.completed && !m.failed).length;
+    if (activeCount >= 14) return;
+    const corps = Object.values(this.state.servers).filter(
+      (s) => (s.kind === "internal_services" || s.kind === "central_mainframe") && !s.destroyed && s.files.length > 0
+    );
+    if (corps.length === 0) return;
+    const target = this.rng.pick(corps);
+    const file = this.rng.pick(target.files);
+    const isSteal = this.rng.chance(0.5);
+    const diff = this.rng.int(2, 6);
+    const payment = diff * (isSteal ? 900 : 800);
+    const mission: Mission = {
+      id: this.nextId("mission"),
+      kind: isSteal ? "steal_file" : "destroy_file",
+      title: isSteal
+        ? `Extract ${file.name} from ${target.companyName}`
+        : `Erase ${file.name} on ${target.companyName}`,
+      employer: "Anonymous Corporate Client",
+      description: isSteal
+        ? `Break into ${target.name} (${target.ip}) and copy ${file.name} to your gateway.`
+        : `Break into ${target.name} (${target.ip}) and delete ${file.name}.`,
+      difficulty: diff,
+      payment,
+      minUplinkRating: Math.max(0, diff - 2),
+      targetIp: target.ip,
+      targetFileName: file.name,
+      accepted: false,
+      completed: false,
+    };
+    this.state.missions.push(mission);
   }
 
   runPassiveTraceAudit(startIp: string): boolean {
@@ -1277,9 +2039,17 @@ export class UplinkEngine {
 
     for (let step = 0; step < 32; step++) {
       if (currentIp === this.state.player.gateway.ip) {
-        this.disavowPlayer(
-          `Passive trace audit from ${startIp} followed your bounce logs back to your gateway.`
-        );
+        const origin = this.state.servers[startIp];
+        if (origin) {
+          this.handleCaughtHacking(
+            origin,
+            `Passive trace audit from ${startIp} followed your bounce logs back to your gateway.`
+          );
+        } else {
+          this.disavowPlayer(
+            `Passive trace audit from ${startIp} followed your bounce logs back to your gateway.`
+          );
+        }
         return true;
       }
       if (visited.has(currentIp)) return false;
@@ -1325,7 +2095,7 @@ export class UplinkEngine {
 
   acceptMission(missionId: string): boolean {
     const m = this.state.missions.find((x) => x.id === missionId);
-    if (!m || m.accepted || m.completed) return false;
+    if (!m || m.accepted || m.completed || m.failed) return false;
     m.accepted = true;
     const target = this.state.servers[m.targetIp];
     if (target) target.discovered = true;
@@ -1335,7 +2105,18 @@ export class UplinkEngine {
 
   completeMission(missionId: string): boolean {
     const m = this.state.missions.find((x) => x.id === missionId);
-    if (!m || !m.accepted || m.completed) return false;
+    if (!m || !m.accepted || m.completed || m.failed) return false;
+
+    if (m.kind === "pay_fine" && m.targetAmount) {
+      if (this.state.player.credits < m.targetAmount) {
+        this.events.emit({ type: "notice", level: "warn", message: "Insufficient credits to pay fine." });
+        return false;
+      }
+      this.state.player.credits -= m.targetAmount;
+      m.completed = true;
+      this.events.emit({ type: "mission.completed", missionId: m.id, payment: -m.targetAmount });
+      return true;
+    }
 
     const target = this.state.servers[m.targetIp];
     if (!target) return false;
@@ -1368,6 +2149,15 @@ export class UplinkEngine {
         });
         return false;
       }
+    } else if (m.kind === "remove_computer") {
+      if (!target.destroyed) {
+        this.events.emit({
+          type: "notice",
+          level: "warn",
+          message: `${target.name} is still operational. Delete /sys and run 'shutdown' in Remote Console.`,
+        });
+        return false;
+      }
     } else if (m.kind === "change_academic" && m.targetCitizenId) {
       const cit = this.state.citizens[m.targetCitizenId];
       if (!cit || cit.gpa !== m.targetValue) {
@@ -1388,6 +2178,16 @@ export class UplinkEngine {
         });
         return false;
       }
+    } else if (m.kind === "frame_user" && m.targetCitizenId) {
+      const cit = this.state.citizens[m.targetCitizenId];
+      if (!cit || !cit.arrestWarrant || cit.criminalHistory.length === 0) {
+        this.events.emit({
+          type: "notice",
+          level: "warn",
+          message: `${cit?.fullName ?? "Target"} needs both a criminal conviction and an active arrest warrant.`,
+        });
+        return false;
+      }
     } else if (m.kind === "change_social" && m.targetCitizenId) {
       const cit = this.state.citizens[m.targetCitizenId];
       if (!cit || cit.employment !== m.targetValue) {
@@ -1395,6 +2195,16 @@ export class UplinkEngine {
           type: "notice",
           level: "warn",
           message: `${cit?.fullName ?? "Target"}'s employer is not set to ${m.targetValue}.`,
+        });
+        return false;
+      }
+    } else if (m.kind === "change_medical" && m.targetCitizenId) {
+      const cit = this.state.citizens[m.targetCitizenId];
+      if (!cit || !cit.medicalHistory.some((h) => h === m.targetValue)) {
+        this.events.emit({
+          type: "notice",
+          level: "warn",
+          message: `${cit?.fullName ?? "Target"}'s medical record has not been updated to "${m.targetValue}".`,
         });
         return false;
       }
@@ -1413,12 +2223,42 @@ export class UplinkEngine {
         });
         return false;
       }
+    } else if (m.kind === "story_special") {
+      if (m.specialMissionCode === "MAIDEN_FLIGHT" && !target.revelationInfected) {
+        this.events.emit({ type: "notice", level: "warn", message: `Deploy Revelation on ${target.name} first.` });
+        return false;
+      }
+      if (m.specialMissionCode === "BACKFIRE" && m.targetFileName) {
+        const idx = this.state.player.gateway.files.findIndex(
+          (f) => f.name === m.targetFileName && f.encryptedLevel === 0
+        );
+        if (idx === -1) {
+          this.events.emit({
+            type: "notice",
+            level: "warn",
+            message: `Copy and decrypt ${m.targetFileName} from ARC first.`,
+          });
+          return false;
+        }
+        this.state.player.gateway.files.splice(idx, 1);
+      }
+      if (m.specialMissionCode === "GRAND_TOUR" && this.state.story.stage !== "arc_victory") {
+        this.events.emit({ type: "notice", level: "warn", message: "Revelation has not reached critical mass yet." });
+        return false;
+      }
+      if (m.specialMissionCode === "COUNTERATTACK" && this.state.story.stage !== "arunmor_victory") {
+        this.events.emit({ type: "notice", level: "warn", message: "Faith has not neutralized Revelation yet." });
+        return false;
+      }
+      if (m.specialMissionCode) {
+        this.state.story.completedSpecialMissions.push(m.specialMissionCode);
+      }
     }
 
     m.completed = true;
     this.state.player.credits += m.payment;
     this.state.player.uplinkScore += m.difficulty * 3;
-    this.state.player.neuromancerScore += m.kind === "destroy_file" ? 5 : m.kind === "bank_heist" ? -10 : 0;
+    this.state.player.neuromancerScore += (NEUROMANCER_MISSION_DELTA[m.kind] ?? 0) * m.difficulty;
 
     this.state.emails.unshift({
       id: this.nextId("email"),
@@ -1488,17 +2328,87 @@ export class UplinkEngine {
     return true;
   }
 
-  upgradeGateway(specId: string): boolean {
-    const spec = GATEWAY_CATALOG.find((g) => g.id === specId);
+  buyModem(modemId: string): boolean {
+    const spec = MODEM_CATALOG.find((m) => m.id === modemId);
     if (!spec) return false;
-    if (this.state.player.gateway.specId === spec.id) return false;
     if (this.state.player.credits < spec.cost) return false;
+    if (this.state.player.gateway.modemGbps >= spec.gbps) return false;
 
     this.state.player.credits -= spec.cost;
-    this.state.player.gateway.specId = spec.id;
-    this.state.player.gateway.memoryTotalGq = spec.maxMemoryGq;
-    this.state.player.gateway.bandwidthGbps = spec.bandwidthGbps;
-    this.events.emit({ type: "notice", level: "info", message: `Upgraded to ${spec.name}` });
+    this.state.player.gateway.modemGbps = spec.gbps;
+    this.events.emit({ type: "notice", level: "info", message: `Installed ${spec.name}` });
     return true;
+  }
+
+  buyMemory(memId: string): boolean {
+    const spec = MEMORY_CATALOG.find((m) => m.id === memId);
+    const gwSpec = GATEWAY_CATALOG.find((g) => g.id === this.state.player.gateway.specId);
+    if (!spec || !gwSpec) return false;
+    if (this.state.player.credits < spec.cost) return false;
+    if (this.state.player.gateway.memoryTotalGq + spec.gq > gwSpec.maxMemoryGq) {
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: `Exceeds ${gwSpec.name} max memory (${gwSpec.maxMemoryGq} Gq). Upgrade gateway first.`,
+      });
+      return false;
+    }
+
+    this.state.player.credits -= spec.cost;
+    this.state.player.gateway.memoryTotalGq += spec.gq;
+    this.events.emit({ type: "notice", level: "info", message: `Installed ${spec.name}` });
+    return true;
+  }
+
+  buyGatewaySecurity(deviceId: GatewaySecurityDevice): boolean {
+    const spec = GATEWAY_SECURITY_CATALOG.find((d) => d.id === deviceId);
+    const gwSpec = GATEWAY_CATALOG.find((g) => g.id === this.state.player.gateway.specId);
+    if (!spec || !gwSpec) return false;
+    if (this.state.player.credits < spec.cost) return false;
+    if (this.state.player.gateway.securityDevices.includes(deviceId)) return false;
+    if (this.state.player.gateway.securityDevices.length >= gwSpec.maxSecuritySlots) {
+      this.events.emit({
+        type: "notice",
+        level: "warn",
+        message: `All ${gwSpec.maxSecuritySlots} security slot(s) occupied on ${gwSpec.name}.`,
+      });
+      return false;
+    }
+
+    this.state.player.credits -= spec.cost;
+    this.state.player.gateway.securityDevices.push(deviceId);
+    this.events.emit({ type: "notice", level: "info", message: `Installed ${spec.name}` });
+    return true;
+  }
+
+  upgradeGateway(specId: string): boolean {
+    const spec = GATEWAY_CATALOG.find((g) => g.id === specId);
+    const curSpec = GATEWAY_CATALOG.find((g) => g.id === this.state.player.gateway.specId);
+    if (!spec) return false;
+    if (this.state.player.gateway.specId === spec.id) return false;
+
+    const tradeIn = curSpec ? Math.round(curSpec.cost * PLAYER_DEFAULTS.gatewayPartExchangeRate) : 0;
+    const netCost = Math.max(0, spec.cost - tradeIn);
+    if (this.state.player.credits < netCost) return false;
+
+    this.state.player.credits -= netCost;
+    this.state.player.gateway.specId = spec.id;
+    this.state.player.gateway.gatewayIdNumber += 1;
+    this.state.player.gateway.memoryTotalGq = Math.max(
+      this.state.player.gateway.memoryTotalGq,
+      Math.min(spec.maxMemoryGq, Math.max(24, Math.floor(spec.maxMemoryGq / 2)))
+    );
+    this.state.player.gateway.bandwidthGbps = spec.bandwidthGbps;
+    this.events.emit({
+      type: "notice",
+      level: "info",
+      message: `Upgraded to ${spec.name} (net ${netCost.toLocaleString()}c after 75% trade-in).`,
+    });
+    return true;
+  }
+
+  /** Helper exposing canonical InterNIC IP */
+  getInternicIp(): string {
+    return FIXED_IPS.INTERNIC;
   }
 }
