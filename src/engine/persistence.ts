@@ -1,76 +1,79 @@
 import type { WorldState } from "./types";
 
-const STORAGE_KEY = "uplink_ts_save_v2";
-const IDB_NAME = "uplink_ts_db";
-const IDB_STORE = "saves";
+const DB_NAME = "uplink_ts_saves";
+const STORE_NAME = "slots";
+const DB_VERSION = 1;
 
-export function serializeState(state: Readonly<WorldState>): string {
+export function serializeState(state: WorldState): string {
   return JSON.stringify(state);
 }
 
 export function deserializeState(raw: string): WorldState {
-  const parsed: unknown = JSON.parse(raw);
-  if (
-    typeof parsed !== "object" ||
-    parsed === null ||
-    (parsed as { schemaVersion?: unknown }).schemaVersion !== 2
-  ) {
-    throw new Error("Unsupported or outdated save schema (expected schemaVersion: 2)");
+  const parsed = JSON.parse(raw) as Partial<WorldState>;
+  if (!parsed || parsed.schemaVersion !== 3 || !parsed.player || !parsed.servers) {
+    throw new Error("Invalid or incompatible Uplink-TS save file (expected schema v3).");
   }
   return parsed as WorldState;
 }
 
-function openDb(): Promise<IDBDatabase | null> {
-  if (typeof indexedDB === "undefined") return Promise.resolve(null);
-  return new Promise((resolve) => {
-    const req = indexedDB.open(IDB_NAME, 1);
+function openDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === "undefined") {
+      reject(new Error("IndexedDB unavailable"));
+      return;
+    }
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
-      if (!req.result.objectStoreNames.contains(IDB_STORE)) {
-        req.result.createObjectStore(IDB_STORE);
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
       }
     };
     req.onsuccess = () => resolve(req.result);
-    req.onerror = () => resolve(null);
+    req.onerror = () => reject(req.error ?? new Error("Failed to open IndexedDB"));
   });
 }
 
-export async function saveToSlot(slot: string, state: Readonly<WorldState>): Promise<void> {
-  const raw = serializeState(state);
-  if (typeof localStorage !== "undefined") {
-    localStorage.setItem(`${STORAGE_KEY}_${slot}`, raw);
-  }
-  const db = await openDb();
-  if (!db) return;
-  await new Promise<void>((resolve) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    tx.objectStore(IDB_STORE).put(raw, slot);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => resolve();
-  });
-}
-
-export async function loadFromSlot(slot: string): Promise<WorldState | null> {
-  const db = await openDb();
-  if (db) {
-    const raw = await new Promise<string | null>((resolve) => {
-      const tx = db.transaction(IDB_STORE, "readonly");
-      const req = tx.objectStore(IDB_STORE).get(slot);
-      req.onsuccess = () => resolve(typeof req.result === "string" ? req.result : null);
-      req.onerror = () => resolve(null);
+export async function saveToSlot(slotId: string, state: WorldState): Promise<void> {
+  const payload = serializeState(state);
+  try {
+    const db = await openDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).put(payload, slotId);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB write failed"));
     });
-    if (raw) {
-      try {
-        return deserializeState(raw);
-      } catch {
-        return null;
-      }
+    db.close();
+  } catch {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(`uplink_ts_slot_${slotId}`, payload);
     }
   }
-  if (typeof localStorage !== "undefined") {
-    const raw = localStorage.getItem(`${STORAGE_KEY}_${slot}`);
+}
+
+export async function loadFromSlot(slotId: string): Promise<WorldState | null> {
+  try {
+    const db = await openDb();
+    const raw = await new Promise<string | undefined>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readonly");
+      const req = tx.objectStore(STORE_NAME).get(slotId);
+      req.onsuccess = () => resolve(req.result as string | undefined);
+      req.onerror = () => reject(req.error ?? new Error("IndexedDB read failed"));
+    });
+    db.close();
     if (raw) {
+      return deserializeState(raw);
+    }
+  } catch {
+    // Fallback to localStorage below
+  }
+
+  if (typeof localStorage !== "undefined") {
+    const fallback = localStorage.getItem(`uplink_ts_slot_${slotId}`);
+    if (fallback) {
       try {
-        return deserializeState(raw);
+        return deserializeState(fallback);
       } catch {
         return null;
       }
@@ -79,16 +82,20 @@ export async function loadFromSlot(slot: string): Promise<WorldState | null> {
   return null;
 }
 
-export async function clearSlot(slot: string): Promise<void> {
-  if (typeof localStorage !== "undefined") {
-    localStorage.removeItem(`${STORAGE_KEY}_${slot}`);
+export async function clearSlot(slotId: string): Promise<void> {
+  try {
+    const db = await openDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).delete(slotId);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB delete failed"));
+    });
+    db.close();
+  } catch {
+    // ignore
   }
-  const db = await openDb();
-  if (!db) return;
-  await new Promise<void>((resolve) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    tx.objectStore(IDB_STORE).delete(slot);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => resolve();
-  });
+  if (typeof localStorage !== "undefined") {
+    localStorage.removeItem(`uplink_ts_slot_${slotId}`);
+  }
 }
